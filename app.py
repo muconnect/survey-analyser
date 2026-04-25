@@ -12,12 +12,7 @@ import os
 @st.cache_resource
 def install_playwright():
     """Forces the Streamlit server to download the Chromium binary and dependencies on boot."""
-    # Installs the browser
     os.system("playwright install chromium")
-    # Installs the required Linux system dependencies for the browser
-    # os.system("playwright install-deps chromium")
-
-install_playwright()
 
 # ─────────────────────────────────────────────
 #  WINDOWS EVENT LOOP FIX (MUST COME FIRST)
@@ -34,30 +29,7 @@ if sys.platform == "win32":
 from playwright.sync_api import sync_playwright
 import plotly.io as pio
 
-# ─────────────────────────────────────────────
-#  STREAMLIT CLOUD PLAYWRIGHT INSTALLER
-# ─────────────────────────────────────────────
-# This forces the Streamlit server to download the Chromium binary on boot
-@st.cache_resource
-def install_playwright():
-    os.system("playwright install chromium")
-
-# ─────────────────────────────────────────────
-#  WINDOWS EVENT LOOP FIX (WITH WARNING MUTE)
-# ─────────────────────────────────────────────
-if sys.platform == "win32":
-    # Mute the Python 3.14+ deprecation warnings to keep the console clean
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=DeprecationWarning)
-        try:
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        except AttributeError:
-            pass # Failsafe just in case it gets fully removed in a future test build
-
-# ─────────────────────────────────────────────
-#  PAGE CONFIG
-# ─────────────────────────────────────────────
-st.set_page_config(
+APP_PAGE_CONFIG = dict(
     page_title="R-Cube Strategic Intelligence",
     page_icon="🏛️",
     layout="wide",
@@ -187,8 +159,6 @@ h1, h2, h3 { font-family: 'Playfair Display', serif !important; color: #0f172a !
 hr { border-color: #e2e8f0 !important; }
 """
 
-st.markdown(f"<style>{CUSTOM_CSS}</style>", unsafe_allow_html=True)
- 
 # ─────────────────────────────────────────────
 #  CONSTANTS
 # ─────────────────────────────────────────────
@@ -271,6 +241,49 @@ def calculate_metrics(df):
  
     df['Growth_Index'] = (0.35 * df['Relevance'] + 0.40 * df['Reliability_Adj'] + 0.25 * df['Reputability_Adj'])
     return df
+
+
+def prepare_results(raw):
+    raw = raw.copy()
+    q_cols = raw.columns[8:28]
+    raw = raw.rename(columns={q_cols[i]: f'Q{i+1}' for i in range(len(q_cols))})
+
+    if 'name' in raw.columns:
+        raw_names = raw['name'].fillna("Unknown").astype(str).tolist()
+    else:
+        try:
+            raw_names = raw.iloc[:, 29].fillna("Unknown").astype(str).tolist()
+        except IndexError:
+            raw_names = [f"User {i+1}" for i in range(len(raw))]
+
+    display_names = [name.title().strip() for name in raw_names]
+
+    unique_ids = []
+    seen = {}
+    for name in display_names:
+        if name in seen:
+            seen[name] += 1
+            unique_ids.append(f"{name} ({seen[name]})")
+        else:
+            seen[name] = 1
+            unique_ids.append(name)
+
+    raw.insert(0, 'UserID', unique_ids)
+    raw.insert(1, 'Display_Name', display_names)
+
+    for i in range(1, 21):
+        raw[f'Q{i}'] = raw[f'Q{i}'].map(RESPONSE_MAP).fillna(3)
+
+    return calculate_metrics(raw)
+
+
+def find_column_name(df, candidates):
+    normalized = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        match = normalized.get(candidate.strip().lower())
+        if match is not None:
+            return match
+    return None
 
 # ─────────────────────────────────────────────
 #  CHART BUILDERS
@@ -363,7 +376,7 @@ def stage_bar_html(row):
 
 def score_explanation_html():
     return (
-        '<div class="explain-wrap"><div class="explain-head">Teacher&#39;s Individual Dashboard</div><div class="explain-sub">How Your Scores Are Calculated</div><div class="explain-grid">'
+        '<div class="explain-wrap"><div class="explain-head">How Your Scores Are Calculated</div><div class="explain-sub"></div><div class="explain-grid">'
         '<div class="explain-card exp-rel"><h4>Relevance</h4><ul><li>Meets immediate needs of parents and students.</li><li>Focus on curriculum alignment, compliance, visibility.</li><li>Creates a unique value proposition that differentiates.</li></ul></div>'
         '<div class="explain-card exp-reli"><h4>Reliability</h4><ul><li>Community trusts consistent delivery year after year.</li><li>Strong outcomes, defined SOPs, parent engagement.</li><li>Innovates and creates scalable systems.</li></ul></div>'
         '<div class="explain-card exp-repu"><h4>Reputability</h4><ul><li>Recognized at state, national, or international levels.</li><li>Engages in legacy-building initiatives.</li><li>Seen as a benchmark of excellence.</li></ul></div>'
@@ -525,112 +538,82 @@ def generate_user_pdf_playwright(row):
         browser.close()
         return pdf_bytes
 
-# ─────────────────────────────────────────────
-#  SIDEBAR
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("""
-    <div style='padding: 0.5rem 0 1.5rem 0;'>
-        <div style='font-family: Playfair Display, serif; font-size: 1.5rem; font-weight: 900; color: #0f172a; line-height: 1.1;'>
-            R-Cube<br>Strategic Intelligence
+def run_app():
+    install_playwright()
+    st.set_page_config(**APP_PAGE_CONFIG)
+    st.markdown(f"<style>{CUSTOM_CSS}</style>", unsafe_allow_html=True)
+
+    with st.sidebar:
+        st.markdown("""
+        <div style='padding: 0.5rem 0 1.5rem 0;'>
+            <div style='font-family: Playfair Display, serif; font-size: 1.5rem; font-weight: 900; color: #0f172a; line-height: 1.1;'>
+                R-Cube<br>Strategic Intelligence
+            </div>
+            <div style='font-family: DM Mono, monospace; font-size: 0.65rem; letter-spacing: 0.2em; color: #64748b; text-transform: uppercase; margin-top: 0.4rem;'>
+                Screening Metric v2
+            </div>
         </div>
-        <div style='font-family: DM Mono, monospace; font-size: 0.65rem; letter-spacing: 0.2em; color: #64748b; text-transform: uppercase; margin-top: 0.4rem;'>
-            Screening Metric v2
+        """, unsafe_allow_html=True)
+
+        uploaded_file = st.file_uploader("Upload Response CSV", type=["csv"])
+
+        st.markdown("---")
+        st.markdown("""
+        <div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #475569; letter-spacing: 0.1em; text-transform: uppercase;'>
+        Scoring Model
         </div>
-    </div>
-    """, unsafe_allow_html=True)
- 
-    uploaded_file = st.file_uploader("Upload Response CSV", type=["csv"])
- 
-    st.markdown("---")
-    st.markdown("""
-    <div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #475569; letter-spacing: 0.1em; text-transform: uppercase;'>
-    Scoring Model
-    </div>
-    <div style='font-size: 0.78rem; color: #64748b; margin-top: 0.5rem; line-height: 1.6;'>
-    <b style='color:#d97706;'>Relevance</b> — Q1,2,5,11,13,14<br>
-    <b style='color:#2563eb;'>Reliability</b> — Q3,4,6-10,12,14,15<br>
-    <b style='color:#7c3aed;'>Reputability</b> — Q16–20<br><br>
-    <span style='background: #f1f5f9; padding: 2px 4px; border-radius:4px; color:#0f172a;'>GI = 0.35·R + 0.40·Rel + 0.25·Rep</span>
-    </div>
-    """, unsafe_allow_html=True)
- 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
-if not uploaded_file:
-    st.markdown("""
-    <div style='display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 70vh; text-align: center; padding: 2rem;'>
-        <div style='font-family: Playfair Display, serif; font-size: 3.5rem; font-weight: 900; color: #0f172a; line-height: 1.1; max-width: 700px;'>
-            R-Cube Strategic<br>Command Centre
+        <div style='font-size: 0.78rem; color: #64748b; margin-top: 0.5rem; line-height: 1.6;'>
+        <b style='color:#d97706;'>Relevance</b> — Q1,2,5,11,13,14<br>
+        <b style='color:#2563eb;'>Reliability</b> — Q3,4,6-10,12,14,15<br>
+        <b style='color:#7c3aed;'>Reputability</b> — Q16–20<br><br>
+        <span style='background: #f1f5f9; padding: 2px 4px; border-radius:4px; color:#0f172a;'>GI = 0.35·R + 0.40·Rel + 0.25·Rep</span>
         </div>
-        <div style='font-family: DM Sans, sans-serif; font-size: 1.1rem; color: #475569; margin-top: 1rem; max-width: 480px; line-height: 1.7;'>
-            Upload your response CSV to generate per-user strategic profiles, maturity-adjusted R-scores, and stage diagnostics.
+        """, unsafe_allow_html=True)
+
+    if not uploaded_file:
+        st.markdown("""
+        <div style='display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 70vh; text-align: center; padding: 2rem;'>
+            <div style='font-family: Playfair Display, serif; font-size: 3.5rem; font-weight: 900; color: #0f172a; line-height: 1.1; max-width: 700px;'>
+                R-Cube Strategic<br>Command Centre
+            </div>
+            <div style='font-family: DM Sans, sans-serif; font-size: 1.1rem; color: #475569; margin-top: 1rem; max-width: 480px; line-height: 1.7;'>
+                Upload your response CSV to generate per-user strategic profiles, maturity-adjusted R-scores, and stage diagnostics.
+            </div>
+            <div style='margin-top: 2.5rem; font-family: DM Mono, monospace; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.2em; text-transform: uppercase; color: #334155; border: 1px dashed #cbd5e1; background: #ffffff; padding: 0.75rem 1.5rem; border-radius: 8px;'>
+                ← Upload CSV in sidebar to begin
+            </div>
         </div>
-        <div style='margin-top: 2.5rem; font-family: DM Mono, monospace; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.2em; text-transform: uppercase; color: #334155; border: 1px dashed #cbd5e1; background: #ffffff; padding: 0.75rem 1.5rem; border-radius: 8px;'>
-            ← Upload CSV in sidebar to begin
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
- 
-else:
+        """, unsafe_allow_html=True)
+        return
+
     raw = pd.read_csv(uploaded_file)
-    q_cols = raw.columns[8:28]
-    raw = raw.rename(columns={q_cols[i]: f'Q{i+1}' for i in range(len(q_cols))})
-    # --- START NEW NAME EXTRACTION LOGIC ---
-    if 'name' in raw.columns:
-        raw_names = raw['name'].fillna("Unknown").astype(str).tolist()
-    else:
-        try:
-            raw_names = raw.iloc[:, 29].fillna("Unknown").astype(str).tolist()
-        except IndexError:
-            raw_names = [f"User {i+1}" for i in range(len(raw))]
-            
-    # Clean names for the PDF (e.g., "John Doe")
-    display_names = [name.title().strip() for name in raw_names]
-            
-    # Unique IDs for the Streamlit dropdown (e.g., "John Doe (2)")
-    unique_ids = []
-    seen = {}
-    for name in display_names:
-        if name in seen:
-            seen[name] += 1
-            unique_ids.append(f"{name} ({seen[name]})")
-        else:
-            seen[name] = 1
-            unique_ids.append(name)
-            
-    raw.insert(0, 'UserID', unique_ids)
-    raw.insert(1, 'Display_Name', display_names)
-    # --- END NEW NAME EXTRACTION LOGIC ---
-    
-    for i in range(1, 21): raw[f'Q{i}'] = raw[f'Q{i}'].map(RESPONSE_MAP).fillna(3)
- 
-    results = calculate_metrics(raw)
- 
-    # ── Sidebar: User Slicer
+    results = prepare_results(raw)
+    status_col = find_column_name(raw, ["status", "mail status", "email status"])
+    pending_count = (
+        raw[status_col].astype(str).str.strip().eq("Pending").sum()
+        if status_col is not None
+        else len(raw)
+    )
+
     with st.sidebar:
         st.markdown("---")
         user_choice = st.selectbox("Select User Report", results['UserID'].tolist())
-        
+
         st.markdown(f"""
         <div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase; margin-top: 1rem;'>Cohort Size</div>
         <div style='font-family: Playfair Display, serif; font-size: 2rem; font-weight: 900; color: #0f172a;'>{len(results)}</div>
         """, unsafe_allow_html=True)
- 
+
         avg_gi = results['Growth_Index'].mean()
-        rank   = int(results['Growth_Index'].rank(ascending=False)[results['UserID'] == user_choice].values[0])
+        rank = int(results['Growth_Index'].rank(ascending=False)[results['UserID'] == user_choice].values[0])
         st.markdown(f"""
         <div style='margin-top: 1rem;'><div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase;'>Cohort Avg GI</div><div style='font-family: Playfair Display, serif; font-size: 1.6rem; font-weight: 900; color: #0f172a;'>{avg_gi:.1f}</div></div>
         <div style='margin-top: 1rem;'><div style='font-family: DM Mono, monospace; font-size: 0.6rem; color: #64748b; letter-spacing: 0.1em; text-transform: uppercase;'>Current Rank</div><div style='font-family: Playfair Display, serif; font-size: 1.6rem; font-weight: 900; color: #059669;'>#{rank} / {len(results)}</div></div>
         """, unsafe_allow_html=True)
- 
+
     row = results[results['UserID'] == user_choice].iloc[0]
     label, badge_cls, desc = get_strategic_profile(row)
-    
-    # ════════════════════════════════════
-    #  HEADER
-    # ════════════════════════════════════
+
     st.markdown(f"""
     <div style='margin-bottom: 0.5rem; margin-top: 2rem;'>
         <div style='font-family: DM Mono, monospace; font-size: 0.7rem; color: #64748b; letter-spacing: 0.2em; text-transform: uppercase; margin-bottom: 0.3rem;'>
@@ -641,55 +624,44 @@ else:
         </div>
     </div>
     """, unsafe_allow_html=True)
- 
-    # ════════════════════════════════════
-    #  KPI + POSITION CURVE
-    # ════════════════════════════════════
+
     k_left, k_right = st.columns([1, 1.45])
-    with k_left: st.markdown(kpi_card("Growth Index", row['Growth_Index'], "growth", "growth"), unsafe_allow_html=True)
-    with k_right: st.plotly_chart(sigmoid_position_chart(row['Growth_Index']), width='stretch')
+    with k_left:
+        st.markdown(kpi_card("Growth Index", row['Growth_Index'], "growth", "growth"), unsafe_allow_html=True)
+    with k_right:
+        st.plotly_chart(sigmoid_position_chart(row['Growth_Index']), width='stretch')
 
     st.markdown(f"""<div class="status-row"><span class="status-badge {badge_cls}">{label}</span><span class="badge-desc">{desc}</span></div><br>""", unsafe_allow_html=True)
 
-    # ════════════════════════════════════
-    #  SECTION 1 — R-Score Gauges
-    # ════════════════════════════════════
     st.markdown(section_header("01", "R-Cube Maturity Gauges"), unsafe_allow_html=True)
-
     g1, g2, g3 = st.columns(3)
-    with g1: st.plotly_chart(gauge_chart(row['Relevance'],       "RELEVANCE",       "#d97706"), width='stretch')
-    with g2: st.plotly_chart(gauge_chart(row['Reliability_Adj'], "RELIABILITY (ADJ)", "#2563eb"), width='stretch')
-    with g3: st.plotly_chart(gauge_chart(row['Reputability_Adj'], "REPUTABILITY (ADJ)", "#7c3aed"), width='stretch')
+    with g1:
+        st.plotly_chart(gauge_chart(row['Relevance'], "RELEVANCE", "#d97706"), width='stretch')
+    with g2:
+        st.plotly_chart(gauge_chart(row['Reliability_Adj'], "RELIABILITY (ADJ)", "#2563eb"), width='stretch')
+    with g3:
+        st.plotly_chart(gauge_chart(row['Reputability_Adj'], "REPUTABILITY (ADJ)", "#7c3aed"), width='stretch')
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown(score_explanation_html(), unsafe_allow_html=True)
 
-    # ════════════════════════════════════
-    #  SECTION 2 — Stage Profile + Radar
-    # ════════════════════════════════════
     st.markdown(section_header("02", "Growth Stage Profile"), unsafe_allow_html=True)
-
     col_a, col_b = st.columns([1, 1])
-    with col_a: st.markdown(stage_bar_html(row), unsafe_allow_html=True)
-    with col_b: st.plotly_chart(radar_chart(row), width='stretch')
+    with col_a:
+        st.markdown(stage_bar_html(row), unsafe_allow_html=True)
+    with col_b:
+        st.plotly_chart(radar_chart(row), width='stretch')
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown(growth_stage_focus_html(), unsafe_allow_html=True)
     st.markdown("<hr>", unsafe_allow_html=True)
- 
-    # ─────────────────────────────────────────────
-    #  DYNAMIC PDF EXPORT BUTTON
-    # ─────────────────────────────────────────────
     st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
-    
+
     if st.button(f"📄 Compile High-Fidelity PDF for {user_choice}", type="primary"):
         with st.spinner("Spinning up Playwright rendering engine..."):
             try:
-                # Pass the row data directly to the new HTML-based Playwright function
                 pdf_bytes = generate_user_pdf_playwright(row)
-                
                 st.success("PDF rendered successfully!")
-                
                 st.download_button(
                     label="⬇️ Download PDF",
                     data=pdf_bytes,
@@ -699,5 +671,50 @@ else:
                 )
             except Exception as e:
                 st.error(f"Render failed: {e}")
-        
+
+    st.markdown("<div style='margin-top: 2rem;'></div>", unsafe_allow_html=True)
+    st.markdown(section_header("03", "Email Delivery"), unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="explain-wrap">
+            <div class="explain-sub">Batch Sender</div>
+            <div style="color:#334155; line-height:1.7;">
+                Send PDFs directly as email attachments for every row in the uploaded CSV where the status is <b>Pending</b>.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Pending rows in uploaded CSV: {pending_count}")
+
+    if st.button("Send Pending Emails", use_container_width=True):
+        with st.spinner("Generating PDFs and sending emails..."):
+            try:
+                from send_pending_reports import send_pending_reports_from_dataframe
+
+                run_log = send_pending_reports_from_dataframe(raw)
+                success_count = sum(1 for item in run_log if item["status"] == "success")
+                error_count = sum(1 for item in run_log if item["status"] == "error")
+
+                if success_count:
+                    st.success(f"Sent {success_count} email(s).")
+                if error_count:
+                    st.error(f"{error_count} email(s) failed.")
+                if not success_count and not error_count and run_log:
+                    st.info(run_log[0]["message"])
+
+                for item in run_log:
+                    if item["status"] == "success":
+                        st.write(f"- {item['message']}")
+                    elif item["status"] == "error":
+                        st.write(f"- Error: {item['message']}")
+                    else:
+                        st.write(f"- {item['message']}")
+            except Exception as e:
+                st.error(f"Email sending failed: {e}")
+
     st.markdown("""<div style='margin-top: 1rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-family: DM Mono, monospace; font-size: 0.6rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; text-align: center;'>R-Cube Screening Metric · EDXSO Strategic Intelligence · Screening Tool</div>""", unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    run_app()
