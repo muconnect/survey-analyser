@@ -1,5 +1,6 @@
 import base64
 import os
+import re
 from typing import List
 from pathlib import Path
 from typing import Callable
@@ -8,8 +9,6 @@ from email.message import EmailMessage
 
 import pandas as pd
 import requests
-
-from app import generate_user_pdf_playwright, install_playwright, prepare_results
 
 
 def load_local_env(env_path: str = ".env") -> None:
@@ -148,8 +147,20 @@ def render_certificate_email_html(event_date: str) -> str:
     return CERTIFICATE_EMAIL_TEMPLATE.format(date_fragment=date_fragment)
 
 
-def build_pdf_filename(display_name: str) -> str:
-    safe_name = "_".join((display_name or "Participant").split())
+def slugify_filename_part(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    text = re.sub(r"[\s-]+", "_", text.strip())
+    return text.strip("_")
+
+
+def build_pdf_filename(display_name: str, event_name: str = "") -> str:
+    safe_name = slugify_filename_part(display_name or "Participant")
+    safe_event = slugify_filename_part(event_name or "")
+    if safe_event:
+        return f"{safe_event}_{safe_name}.pdf"
     return f"RCube_Report_{safe_name}.pdf"
 
 
@@ -268,6 +279,8 @@ def send_pending_reports_from_dataframe(
     raw_df: pd.DataFrame,
     progress_callback: Callable[[int, int, str, str], None] | None = None,
 ) -> List[dict]:
+    from app import generate_user_pdf_playwright, install_playwright, prepare_results
+
     run_log = []
 
     if raw_df.empty:
@@ -278,6 +291,20 @@ def send_pending_reports_from_dataframe(
     email_col = find_column_name(raw_df, ["email", "email address", "email_address", "mail"])
     name_col = find_column_name(raw_df, ["name", "full name", "full_name", "participant name"])
     status_col = find_column_name(raw_df, ["status", "mail status", "email status"])
+    event_name_col = find_column_name(
+        raw_df,
+        [
+            "event name",
+            "event",
+            "event title",
+            "session name",
+            "session title",
+            "workshop name",
+            "workshop title",
+            "training name",
+            "training title",
+        ],
+    )
     pending_targets = []
 
     for row_idx, report_row in results.iterrows():
@@ -298,10 +325,11 @@ def send_pending_reports_from_dataframe(
 
         try:
             pdf_bytes = generate_user_pdf_playwright(report_row)
+            event_name = get_series_value(source_row, len(source_row), event_name_col)
             response = send_email_with_attachment(
                 email=email,
                 name=name,
-                file_name=build_pdf_filename(report_row["Display_Name"]),
+                file_name=build_pdf_filename(report_row["Display_Name"], event_name),
                 file_bytes=pdf_bytes,
             )
 

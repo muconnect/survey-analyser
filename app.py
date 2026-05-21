@@ -106,6 +106,7 @@ def load_local_env(env_path: str = ".env") -> None:
 load_local_env()
 
 GENERATED_PDF_DIR = Path("generated_pdfs")
+EVENT_DATABASE_URL = os.environ.get("EVENT_DATABASE_URL", "").strip()
 SUPABASE_URL = os.environ.get("VITE_SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_API_KEY = (
     os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
@@ -430,7 +431,14 @@ def resolve_record_display_name(record, fallback="Participant"):
 
 
 def find_email_column(df):
-    return find_column_name(df, ["email", "email address", "email_address", "mail"])
+    exact = find_column_name(df, ["email", "email address", "email_address", "mail"])
+    if exact is not None:
+        return exact
+    for col in df.columns:
+        normalized = str(col).strip().lower()
+        if "email" in normalized or normalized.endswith("mail"):
+            return col
+    return None
 
 
 def find_name_column(df):
@@ -478,17 +486,84 @@ def prepare_assessment_results(raw, base_answer_key, current_api_key):
     return scored, dynamic_answer_key
 
 
+def prepare_certificate_only_results(raw):
+    raw = raw.copy()
+    name_col = find_name_column(raw)
+    email_col = find_email_column(raw)
+    phone_col = find_phone_column(raw)
+    event_name_col = find_event_name_column(raw)
+    date_col = find_date_column(raw)
+
+    raw_names = []
+    for index in range(len(raw)):
+        name_value = raw.iloc[index][name_col] if name_col is not None else ""
+        email_value = raw.iloc[index][email_col] if email_col is not None else ""
+        phone_value = raw.iloc[index][phone_col] if phone_col is not None else ""
+        text_name = "" if pd.isna(name_value) else str(name_value).strip()
+        text_email = "" if pd.isna(email_value) else str(email_value).strip()
+        text_phone = "" if pd.isna(phone_value) else normalize_phone(phone_value)
+        if text_name:
+            raw_names.append(text_name)
+        elif text_email:
+            raw_names.append(text_email.split("@", 1)[0])
+        elif text_phone:
+            raw_names.append(text_phone)
+        else:
+            raw_names.append(f"User {index + 1}")
+
+    display_names, user_ids = make_unique_display_names(raw_names)
+
+    return pd.DataFrame(
+        {
+            "UserID": user_ids,
+            "Display_Name": display_names,
+            "Email": (
+                raw[email_col].fillna("").astype(str).str.strip().tolist()
+                if email_col is not None
+                else [""] * len(raw)
+            ),
+            "Phone": (
+                raw[phone_col].apply(normalize_phone).tolist()
+                if phone_col is not None
+                else [""] * len(raw)
+            ),
+            "Event_Name": (
+                raw[event_name_col].fillna("").astype(str).str.strip().tolist()
+                if event_name_col is not None
+                else [""] * len(raw)
+            ),
+            "Event_Date": (
+                raw[date_col].apply(format_event_date).tolist()
+                if date_col is not None
+                else [""] * len(raw)
+            ),
+        }
+    )
+
+
 def find_column_name(df, candidates):
-    normalized = {str(col).strip().lower(): col for col in df.columns}
     for candidate in candidates:
-        match = normalized.get(candidate.strip().lower())
-        if match is not None:
-            return match
+        candidate_normalized = candidate.strip().lower()
+        for col in df.columns:
+            if str(col).strip().lower() == candidate_normalized:
+                return col
     return None
 
 
-def build_pdf_filename(name):
-    safe_name = "_".join(str(name or "Participant").split())
+def slugify_filename_part(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    text = re.sub(r"[\s-]+", "_", text.strip())
+    return text.strip("_")
+
+
+def build_pdf_filename(name, event_name=""):
+    safe_name = slugify_filename_part(name or "Participant")
+    safe_event = slugify_filename_part(event_name or "")
+    if safe_event:
+        return f"{safe_event}_{safe_name}.pdf"
     return f"RCube_Report_{safe_name}.pdf"
 
 
@@ -499,8 +574,8 @@ def get_row_contact_details(raw, results, user_id):
 
     result_index = match.index[0]
     source_row = raw.iloc[result_index]
-    email_col = find_column_name(raw, ["email", "email address", "email_address", "mail"])
-    name_col = find_column_name(raw, ["name", "full name", "full_name", "participant name"])
+    email_col = find_email_column(raw)
+    name_col = find_name_column(raw)
 
     email = ""
     if email_col is not None:
@@ -555,6 +630,23 @@ def find_date_column(df):
     )
 
 
+def find_event_name_column(df):
+    return find_column_name(
+        df,
+        [
+            "event name",
+            "event",
+            "event title",
+            "session name",
+            "session title",
+            "workshop name",
+            "workshop title",
+            "training name",
+            "training title",
+        ],
+    )
+
+
 def format_event_date(value):
     if value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == "":
         return ""
@@ -588,6 +680,25 @@ def to_display_case(value):
     return "".join(converted)
 
 
+def infer_event_name_from_source_name(source_name):
+    stem = Path(str(source_name or "Event")).stem
+    stem = re.sub(r"(?i)\b(survey_report|survey|prereport|postreport|report|complete)\b", " ", stem)
+    stem = re.sub(r"[_\-]+", " ", stem)
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return to_display_case(stem) if stem else ""
+
+
+def is_fallback_event_name(event_name, source_name=""):
+    candidate = str(event_name or "").strip()
+    if not candidate:
+        return True
+    source_fallback = infer_event_name_from_source_name(source_name) if source_name else ""
+    if source_fallback and candidate.casefold() == source_fallback.casefold():
+        return True
+    normalized = slugify_filename_part(candidate)
+    return normalized.startswith("survey-report-") or normalized.startswith("prereport-") or normalized.startswith("survey26thapril")
+
+
 def infer_event_date_from_source_name(source_name):
     source = str(source_name or "")
     match = re.search(r"(\d{1,2})(?:st|nd|rd|th)?([A-Za-z]+)", source)
@@ -604,7 +715,166 @@ def infer_event_date_from_source_name(source_name):
         return ""
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_registration_details_from_event_db(email="", phone=""):
+    if not EVENT_DATABASE_URL:
+        return {}
+
+    try:
+        import psycopg
+        from psycopg import sql
+    except Exception:
+        return {}
+
+    email = str(email or "").strip().lower()
+    phone_digits = normalize_phone(phone)
+    phone_candidates = []
+    if phone_digits:
+        phone_candidates.append(phone_digits)
+        if len(phone_digits) == 10:
+            phone_candidates.append(f"91{phone_digits}")
+
+    try:
+        with psycopg.connect(EVENT_DATABASE_URL, connect_timeout=3) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select column_name
+                    from information_schema.columns
+                    where table_schema = 'public' and table_name = 'registrations'
+                    """
+                )
+                columns = {row[0] for row in cur.fetchall()}
+                if not columns:
+                    return {}
+
+                def first_present(column_set, *candidates):
+                    for candidate in candidates:
+                        if candidate in column_set:
+                            return candidate
+                    return None
+
+                registration_event_id_col = first_present(columns, "event_id", "eventid")
+                event_table_name = None
+                event_columns = set()
+                for candidate_table in ("event", "events"):
+                    cur.execute(
+                        """
+                        select column_name
+                        from information_schema.columns
+                        where table_schema = 'public' and table_name = %s
+                        """,
+                        (candidate_table,),
+                    )
+                    candidate_columns = {row[0] for row in cur.fetchall()}
+                    if candidate_columns:
+                        event_table_name = candidate_table
+                        event_columns = candidate_columns
+                        break
+
+                registration_event_name_col = first_present(
+                    columns, "event_name", "event", "event_title", "session_name", "workshop_name", "workshop_title", "program_name"
+                )
+
+                select_map = {
+                    "full_name": first_present(columns, "full_name", "name"),
+                    "email": first_present(columns, "email", "email_address"),
+                    "phone": first_present(columns, "phone", "mobile", "phone_number"),
+                    "school_name": first_present(columns, "school_name", "school", "institution_name", "schoolname"),
+                    "event_name": registration_event_name_col,
+                    "created_at": first_present(columns, "created_at"),
+                    "registered_on": first_present(columns, "registered_on", "created_at"),
+                }
+
+                joined_event_name_col = None
+                event_id_pk_col = None
+                if event_table_name and registration_event_id_col:
+                    event_id_pk_col = first_present(event_columns, "id", "event_id", "eventid")
+                    joined_event_name_col = first_present(
+                        event_columns,
+                        "event_name",
+                        "name",
+                        "title",
+                        "event_title",
+                        "session_name",
+                        "workshop_name",
+                        "workshop_title",
+                        "program_name",
+                    )
+                    if joined_event_name_col:
+                        # Always prefer the canonical event title from the event table
+                        # over any registration-side fallback field.
+                        select_map["event_name"] = "__joined_event_name__"
+
+                selected_pairs = [(alias, col) for alias, col in select_map.items() if col]
+                if not selected_pairs:
+                    return {}
+
+                select_items = []
+                for alias, col in selected_pairs:
+                    if col == "__joined_event_name__":
+                        select_items.append(
+                            sql.SQL("evt.{} AS {}").format(
+                                sql.Identifier(joined_event_name_col),
+                                sql.Identifier(alias),
+                            )
+                        )
+                    else:
+                        select_items.append(
+                            sql.SQL("r.{} AS {}").format(
+                                sql.Identifier(col),
+                                sql.Identifier(alias),
+                            )
+                        )
+
+                where_clauses = []
+                params = []
+                if email and select_map["email"]:
+                    where_clauses.append(
+                        sql.SQL("lower(trim(coalesce(r.{}::text, ''))) = %s").format(
+                            sql.Identifier(select_map["email"])
+                        )
+                    )
+                    params.append(email)
+                if phone_candidates and select_map["phone"]:
+                    where_clauses.append(
+                        sql.SQL(
+                            "regexp_replace(coalesce(r.{}::text, ''), '[^0-9]', '', 'g') = ANY(%s)"
+                        ).format(sql.Identifier(select_map["phone"]))
+                    )
+                    params.append(phone_candidates)
+                if not where_clauses:
+                    return {}
+
+                query = sql.SQL("SELECT {fields} FROM public.registrations r").format(
+                    fields=sql.SQL(", ").join(select_items),
+                )
+                if event_table_name and registration_event_id_col and event_id_pk_col and joined_event_name_col:
+                    query += sql.SQL(" LEFT JOIN public.{} evt ON r.{} = evt.{}").format(
+                        sql.Identifier(event_table_name),
+                        sql.Identifier(registration_event_id_col),
+                        sql.Identifier(event_id_pk_col),
+                    )
+                query += sql.SQL(" WHERE {conditions} LIMIT 1").format(
+                    conditions=sql.SQL(" OR ").join(where_clauses)
+                )
+                cur.execute(query, params)
+                row = cur.fetchone()
+                if not row:
+                    return {}
+
+                aliases = [alias for alias, _ in selected_pairs]
+                return dict(zip(aliases, row))
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_registration_details(email="", phone=""):
+    db_record = fetch_registration_details_from_event_db(email=email, phone=phone)
+    if db_record:
+        return db_record
+
     if not SUPABASE_URL or not SUPABASE_API_KEY:
         return {}
 
@@ -662,9 +932,11 @@ def fetch_registration_details(email="", phone=""):
 
 def enrich_certificate_details(details, source_name=""):
     enriched = dict(details or {})
+    source_email = str(enriched.get("email", "") or "").strip()
+    source_phone = normalize_phone(enriched.get("phone", ""))
     registration = fetch_registration_details(
-        email=enriched.get("email", ""),
-        phone=enriched.get("phone", ""),
+        email=source_email,
+        phone=source_phone,
     )
 
     if registration.get("full_name"):
@@ -678,9 +950,17 @@ def enrich_certificate_details(details, source_name=""):
         enriched["school"] = to_display_case(enriched.get("school", ""))
 
     enriched["phone"] = normalize_phone(
-        registration.get("phone", "") or enriched.get("phone", "")
+        registration.get("phone", "") or source_phone
     )
-    enriched["email"] = registration.get("email", "") or enriched.get("email", "")
+    enriched["email"] = source_email
+    existing_event_name = str(enriched.get("event_name", "") or "").strip()
+    if is_fallback_event_name(existing_event_name, source_name):
+        existing_event_name = ""
+    enriched["event_name"] = (
+        str(registration.get("event_name", "") or "").strip()
+        or existing_event_name
+        or infer_event_name_from_source_name(source_name)
+    )
     enriched["event_date"] = (
         enriched.get("event_date", "")
         or infer_event_date_from_source_name(source_name)
@@ -690,15 +970,20 @@ def enrich_certificate_details(details, source_name=""):
 
 
 def get_row_certificate_details(raw, results, user_id):
+    return get_row_certificate_details_with_overrides(raw, results, user_id, None)
+
+
+def get_row_certificate_details_with_overrides(raw, results, user_id, overrides=None):
     match = results[results["UserID"] == user_id]
     if match.empty:
-        return {"school": "", "event_date": "", "phone": ""}
+        return {"school": "", "event_date": "", "phone": "", "event_name": ""}
 
     result_index = match.index[0]
     source_row = raw.iloc[result_index]
     school_col = find_school_column(raw)
     date_col = find_date_column(raw)
     phone_col = find_phone_column(raw)
+    event_name_col = find_event_name_column(raw)
 
     school = ""
     if school_col is not None and school_col in source_row.index:
@@ -713,7 +998,20 @@ def get_row_certificate_details(raw, results, user_id):
     if phone_col is not None and phone_col in source_row.index:
         phone = normalize_phone(source_row[phone_col])
 
-    return {"school": school, "event_date": event_date, "phone": phone}
+    event_name = ""
+    if event_name_col is not None and event_name_col in source_row.index:
+        value = source_row[event_name_col]
+        event_name = "" if pd.isna(value) else str(value).strip()
+
+    overrides = overrides or {}
+    override_event_date = str(overrides.get("event_date", "") or "").strip()
+    override_event_name = str(overrides.get("event_name", "") or "").strip()
+    if override_event_date:
+        event_date = override_event_date
+    if override_event_name:
+        event_name = override_event_name
+
+    return {"school": school, "event_date": event_date, "phone": phone, "event_name": event_name}
 
 
 def get_comparison_contact_details(pre_df, post_df, phone, participant_name):
@@ -914,11 +1212,38 @@ def build_pdf_record_from_file(pdf_path):
         "school": "",
         "event_date": "",
         "phone": "",
+        "event_name": "",
     }
 
 
 def normalize_person_label(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def normalize_email_value(value):
+    text = str(value or "").strip()
+    return text if "@" in text else ""
+
+
+def candidate_person_lookup_keys(*values):
+    keys = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        normalized = normalize_person_label(text)
+        if normalized:
+            keys.add(normalized)
+        parts = [part for part in re.split(r"\s+", text) if part]
+        if parts:
+            first = normalize_person_label(parts[0])
+            if first:
+                keys.add(first)
+        if len(parts) >= 2:
+            first_two = normalize_person_label(" ".join(parts[:2]))
+            if first_two:
+                keys.add(first_two)
+    return keys
 
 
 def load_legacy_root_manifest():
@@ -951,6 +1276,75 @@ def find_source_csv_candidates(source_name):
         except Exception:
             continue
     return candidates
+
+
+def recover_library_record_contact(library_key, source_name, pdf_user, pdf_info):
+    current_email = normalize_email_value(pdf_info.get("email", ""))
+    if current_email:
+        return {
+            "email": current_email,
+            "name": str(pdf_info.get("name", pdf_user) or pdf_user).strip(),
+            "school": str(pdf_info.get("school", "") or "").strip(),
+            "event_date": str(pdf_info.get("event_date", "") or "").strip(),
+            "phone": str(pdf_info.get("phone", "") or "").strip(),
+            "event_name": str(pdf_info.get("event_name", "") or "").strip(),
+        }
+
+    csv_lookup = {}
+    for candidate in find_source_csv_candidates(source_name):
+        csv_lookup = build_email_lookup_from_csv(candidate)
+        if csv_lookup:
+            break
+
+    if not csv_lookup:
+        return {
+            "email": current_email,
+            "name": str(pdf_info.get("name", pdf_user) or pdf_user).strip(),
+            "school": str(pdf_info.get("school", "") or "").strip(),
+            "event_date": str(pdf_info.get("event_date", "") or "").strip(),
+            "phone": str(pdf_info.get("phone", "") or "").strip(),
+            "event_name": str(pdf_info.get("event_name", "") or "").strip(),
+        }
+
+    current_phone = normalize_phone(pdf_info.get("phone", ""))
+    if current_phone:
+        for recovered in csv_lookup.values():
+            if normalize_phone(recovered.get("phone", "")) == current_phone:
+                recovered = dict(recovered)
+                recovered["email"] = normalize_email_value(recovered.get("email", ""))
+                if recovered["email"]:
+                    return recovered
+
+    for key in candidate_person_lookup_keys(
+        pdf_user,
+        pdf_info.get("name", ""),
+        resolve_record_display_name(
+            {"name": pdf_info.get("name", ""), "email": pdf_info.get("email", ""), "UserID": pdf_user},
+            fallback=pdf_user,
+        ),
+    ):
+        if key and key in csv_lookup:
+            recovered = dict(csv_lookup[key])
+            recovered["email"] = normalize_email_value(recovered.get("email", ""))
+            return recovered
+
+    candidate_keys = candidate_person_lookup_keys(pdf_user, pdf_info.get("name", ""))
+    for key in candidate_keys:
+        for lookup_key, recovered in csv_lookup.items():
+            if key and lookup_key and (key.startswith(lookup_key) or lookup_key.startswith(key)):
+                recovered = dict(recovered)
+                recovered["email"] = normalize_email_value(recovered.get("email", ""))
+                if recovered["email"]:
+                    return recovered
+
+    return {
+        "email": current_email,
+        "name": str(pdf_info.get("name", pdf_user) or pdf_user).strip(),
+        "school": str(pdf_info.get("school", "") or "").strip(),
+        "event_date": str(pdf_info.get("event_date", "") or "").strip(),
+        "phone": str(pdf_info.get("phone", "") or "").strip(),
+        "event_name": str(pdf_info.get("event_name", "") or "").strip(),
+    }
 
 
 def get_edxso_logo_data_uri():
@@ -993,17 +1387,29 @@ def generate_certificate_pdf_playwright(
     participant_name,
     school_name="",
     event_date="",
+    event_name="",
     workshop_title="Competency Based Assessment Session",
 ):
     participant_name = html.escape(str(participant_name or "Participant").strip())
     school_name = html.escape(str(school_name or "School").strip())
     event_date = html.escape(str(event_date or "").strip())
-    template_path = Path("/Users/ritu/Desktop/test.html")
+    event_name = html.escape(str(event_name or workshop_title or "").strip())
+    template_path = Path(__file__).resolve().parent / "assets" / "certificate" / "template.html"
     if template_path.exists():
         html_doc = template_path.read_text()
+        html_doc = html_doc.replace("{{LOGO_URI}}", get_edxso_logo_data_uri())
+        html_doc = html_doc.replace(
+            "{{BACKGROUND_URI}}",
+            file_to_data_uri(Path(__file__).resolve().parent / "assets" / "certificate" / "background.png"),
+        )
+        html_doc = html_doc.replace(
+            "{{SIGNATURE_URI}}",
+            file_to_data_uri(Path(__file__).resolve().parent / "assets" / "certificate" / "signature.png"),
+        )
         html_doc = html_doc.replace("{{NAME}}", participant_name)
         html_doc = html_doc.replace("{{SCHOOL}}", school_name)
         html_doc = html_doc.replace("{{DATE}}", event_date)
+        html_doc = html_doc.replace("{{EVENT_NAME}}", event_name)
     else:
         raise FileNotFoundError(f"Certificate template not found: {template_path}")
 
@@ -1013,12 +1419,12 @@ def generate_certificate_pdf_playwright(
             headless=True,
             args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--single-process"],
         )
-        page = browser.new_page(viewport={"width": 1123, "height": 794})
+        page = browser.new_page(viewport={"width": 1280, "height": 720})
         page.set_content(html_doc, wait_until="load")
         page.wait_for_timeout(300)
         pdf_bytes = page.pdf(
-            width="1123px",
-            height="794px",
+            width="1280px",
+            height="720px",
             print_background=True,
             margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
         )
@@ -1031,12 +1437,40 @@ def build_email_lookup_from_csv(csv_path):
         raw = pd.read_csv(csv_path)
     except Exception:
         return {}
+
+    lookup = {}
+    survey_kind = infer_single_survey_kind(raw)
+
+    if survey_kind in {"pre_assessment", "post_assessment"}:
+        api_key = os.getenv("GEMINI_API_KEY")
+        answer_key = PRE_ASSESSMENT_KEY if survey_kind == "pre_assessment" else POST_ASSESSMENT_KEY
+        try:
+            results, _ = prepare_assessment_results(raw, answer_key, api_key)
+        except Exception:
+            return {}
+
+        for _, result_row in results.iterrows():
+            user_id = result_row["UserID"]
+            display_name = result_row["Display_Name"]
+            certificate = get_row_certificate_details(raw, results, user_id)
+            combined = {
+                "email": str(result_row.get("Email", "") or "").strip(),
+                "name": display_name,
+                "school": certificate.get("school", ""),
+                "event_date": certificate.get("event_date", ""),
+                "phone": certificate.get("phone", ""),
+                "event_name": certificate.get("event_name", ""),
+            }
+            for key in candidate_person_lookup_keys(user_id, display_name, combined.get("name", "")):
+                if key:
+                    lookup[key] = combined
+        return lookup
+
     try:
         results = prepare_results(raw)
     except Exception:
         return {}
 
-    lookup = {}
     for _, result_row in results.iterrows():
         user_id = result_row["UserID"]
         display_name = result_row["Display_Name"]
@@ -1048,11 +1482,123 @@ def build_email_lookup_from_csv(csv_path):
             "school": certificate.get("school", ""),
             "event_date": certificate.get("event_date", ""),
             "phone": certificate.get("phone", ""),
+            "event_name": certificate.get("event_name", ""),
         }
-        for key in {normalize_person_label(user_id), normalize_person_label(display_name)}:
+        for key in candidate_person_lookup_keys(user_id, display_name, combined.get("name", "")):
             if key:
                 lookup[key] = combined
     return lookup
+
+
+def find_matching_result_user_id(results, pdf_user, pdf_info):
+    if results is None or results.empty:
+        return None
+
+    if pdf_user in results["UserID"].values:
+        return pdf_user
+
+    record_phone = normalize_phone(pdf_info.get("phone", ""))
+    if record_phone:
+        for _, result_row in results.iterrows():
+            if normalize_phone(result_row.get("Phone", "")) == record_phone:
+                return result_row["UserID"]
+
+    target_keys = set(
+        candidate_person_lookup_keys(
+            pdf_user,
+            pdf_info.get("name", ""),
+            pdf_info.get("email", ""),
+        )
+    )
+    if not target_keys:
+        return None
+
+    for _, result_row in results.iterrows():
+        result_keys = set(
+            candidate_person_lookup_keys(
+                result_row.get("UserID", ""),
+                result_row.get("Display_Name", ""),
+                result_row.get("Email", ""),
+            )
+        )
+        if target_keys & result_keys:
+            return result_row["UserID"]
+        for target_key in target_keys:
+            for result_key in result_keys:
+                if (
+                    target_key
+                    and result_key
+                    and (target_key.startswith(result_key) or result_key.startswith(target_key))
+                ):
+                    return result_row["UserID"]
+    return None
+
+
+def recover_contact_from_current_dataset(raw, results, pdf_user, pdf_info, certificate_overrides=None):
+    matched_user_id = find_matching_result_user_id(results, pdf_user, pdf_info)
+    if not matched_user_id:
+        return {
+            "email": normalize_email_value(pdf_info.get("email", "")),
+            "name": str(pdf_info.get("name", "") or pdf_user).strip(),
+            "school": str(pdf_info.get("school", "") or "").strip(),
+            "event_date": str(pdf_info.get("event_date", "") or "").strip(),
+            "phone": normalize_phone(pdf_info.get("phone", "")),
+            "event_name": str(pdf_info.get("event_name", "") or "").strip(),
+        }
+
+    contact = get_row_contact_details(raw, results, matched_user_id)
+    certificate = get_row_certificate_details_with_overrides(
+        raw,
+        results,
+        matched_user_id,
+        certificate_overrides,
+    )
+    return {
+        "email": normalize_email_value(contact.get("email", "")),
+        "name": str(contact.get("name", "") or matched_user_id).strip(),
+        "school": str(certificate.get("school", "") or "").strip(),
+        "event_date": str(certificate.get("event_date", "") or "").strip(),
+        "phone": normalize_phone(certificate.get("phone", "")),
+        "event_name": str(certificate.get("event_name", "") or "").strip(),
+    }
+
+
+def backfill_library_from_current_dataset(raw, results, library, survey_kind="rcube", certificate_overrides=None):
+    if not library:
+        return library, False
+
+    updated = False
+    for user_id, record in library.items():
+        recovered = recover_contact_from_current_dataset(
+            raw,
+            results,
+            user_id,
+            record,
+            certificate_overrides=certificate_overrides,
+        )
+        new_email = recovered.get("email", "")
+        new_name = recovered.get("name", record.get("name", user_id))
+        new_school = recovered.get("school", "") or record.get("school", "")
+        new_event_date = recovered.get("event_date", "") or record.get("event_date", "")
+        new_phone = recovered.get("phone", "") or record.get("phone", "")
+        new_event_name = recovered.get("event_name", "") or record.get("event_name", "")
+        if (
+            new_email != record.get("email", "")
+            or new_name != record.get("name", user_id)
+            or new_school != record.get("school", "")
+            or new_event_date != record.get("event_date", "")
+            or new_phone != record.get("phone", "")
+            or new_event_name != record.get("event_name", "")
+        ):
+            record["email"] = new_email
+            record["name"] = new_name
+            record["school"] = new_school
+            record["event_date"] = new_event_date
+            record["phone"] = new_phone
+            record["event_name"] = new_event_name
+            updated = True
+
+    return library, updated
 
 
 def backfill_library_contacts(library_key, library):
@@ -1078,19 +1624,29 @@ def backfill_library_contacts(library_key, library):
             break
 
     for user_id, record in library.items():
-        if record.get("email"):
-            continue
         normalized = normalize_person_label(record.get("name", user_id))
         legacy_record = legacy_lookup.get(normalized, {})
         csv_record = csv_lookup.get(normalized, {})
         email = csv_record.get("email") or legacy_record.get("email") or ""
         name = csv_record.get("name") or legacy_record.get("name") or record.get("name", user_id)
-        if email or name != record.get("name", user_id):
+        new_school = csv_record.get("school", record.get("school", ""))
+        new_event_date = csv_record.get("event_date", record.get("event_date", ""))
+        new_phone = csv_record.get("phone", record.get("phone", ""))
+        new_event_name = csv_record.get("event_name", record.get("event_name", ""))
+        if (
+            email != record.get("email", "")
+            or name != record.get("name", user_id)
+            or new_school != record.get("school", "")
+            or new_event_date != record.get("event_date", "")
+            or new_phone != record.get("phone", "")
+            or new_event_name != record.get("event_name", "")
+        ):
             record["email"] = email
             record["name"] = name
-            record["school"] = csv_record.get("school", record.get("school", ""))
-            record["event_date"] = csv_record.get("event_date", record.get("event_date", ""))
-            record["phone"] = csv_record.get("phone", record.get("phone", ""))
+            record["school"] = new_school
+            record["event_date"] = new_event_date
+            record["phone"] = new_phone
+            record["event_name"] = new_event_name
             updated = True
 
     if updated:
@@ -1154,12 +1710,24 @@ def persist_generated_pdf_library(library, library_key):
             "school": record.get("school", ""),
             "event_date": record.get("event_date", ""),
             "phone": record.get("phone", ""),
+            "event_name": record.get("event_name", ""),
         }
     _, index_path = get_library_paths(library_key)
     index_path.write_text(json.dumps(serializable, indent=2))
 
 
-def save_generated_pdf_record(user_id, file_name, pdf_bytes, library_key, email="", name="", school="", event_date="", phone=""):
+def save_generated_pdf_record(
+    user_id,
+    file_name,
+    pdf_bytes,
+    library_key,
+    email="",
+    name="",
+    school="",
+    event_date="",
+    phone="",
+    event_name="",
+):
     library_dir, _ = get_library_paths(library_key)
     file_path = library_dir / file_name
     file_path.write_bytes(pdf_bytes)
@@ -1171,6 +1739,7 @@ def save_generated_pdf_record(user_id, file_name, pdf_bytes, library_key, email=
         "school": school,
         "event_date": event_date,
         "phone": phone,
+        "event_name": event_name,
     }
 
 
@@ -1218,7 +1787,7 @@ def list_all_pdf_libraries(report_type=None):
     return libraries
 
 
-def render_generated_pdf_library(container, report_type="single"):
+def render_generated_pdf_library(container, report_type="single", current_dataset=None):
     with container.container():
         all_libraries = list_all_pdf_libraries(report_type=report_type)
         if not all_libraries:
@@ -1228,6 +1797,7 @@ def render_generated_pdf_library(container, report_type="single"):
         st.markdown(section_header("04", "Generated PDFs"), unsafe_allow_html=True)
         current_library_key = st.session_state.get("current_library_key")
         current_library_size = len(st.session_state.generated_pdfs)
+        certificate_overrides = (current_dataset or {}).get("certificate_overrides", {})
         if current_library_key:
             current_meta = load_library_meta(current_library_key)
             st.caption(
@@ -1241,61 +1811,96 @@ def render_generated_pdf_library(container, report_type="single"):
             is_current = library_key == current_library_key
             survey_title = library["source_name"]
             survey_label = "Current Survey" if is_current else "Previous Survey"
-            certificate_enabled = report_type == "single"
+            certificate_enabled = report_type in {"single", "certificate_only"}
             library_updated = False
             expander_label = f"{survey_title} ({len(records)} reports)"
             with st.expander(expander_label, expanded=is_current):
-                header_info_col, download_col, delete_col = st.columns([10, 1, 1])
+                header_info_col, actions_col = st.columns([12, 1.8])
                 with header_info_col:
                     st.caption(survey_label)
                     if certificate_enabled:
                         st.caption("Certificate email is available in this survey.")
-                with download_col:
-                    st.download_button(
-                        "🗂",
-                        data=build_library_zip_bytes(records),
-                        file_name=f"{Path(survey_title).stem}_reports.zip",
-                        mime="application/zip",
-                        help=f"Download all reports for {survey_title} as a ZIP file",
-                        key=f"download_zip_{library_key}",
-                    )
-                with delete_col:
-                    if st.button(
-                        "🗑",
-                        help=f"Delete all generated reports for {survey_title}",
-                        key=f"delete_library_{library_key}",
-                    ):
-                        clear_generated_pdf_library(library_key)
-                        if library_key == current_library_key:
-                            st.session_state.generated_pdfs = {}
-                        st.success(f"Deleted all generated reports for {survey_title}.")
-                        st.rerun()
+                with actions_col:
+                    download_col, delete_col = st.columns([1, 1], gap="small")
+                    with download_col:
+                        st.download_button(
+                            "⬇",
+                            data=build_library_zip_bytes(records),
+                            file_name=f"{Path(survey_title).stem}_reports.zip",
+                            mime="application/zip",
+                            help=f"Download all reports for {survey_title} as a ZIP file",
+                            key=f"download_zip_{library_key}",
+                        )
+                    with delete_col:
+                        if st.button(
+                            "🗑",
+                            help=f"Delete all generated reports for {survey_title}",
+                            key=f"delete_library_{library_key}",
+                        ):
+                            clear_generated_pdf_library(library_key)
+                            if library_key == current_library_key:
+                                st.session_state.generated_pdfs = {}
+                            st.success(f"Deleted all generated reports for {survey_title}.")
+                            st.rerun()
 
                 if not records:
                     st.info("No PDFs are saved for this survey yet.")
                     continue
 
                 for pdf_user, pdf_info in records.items():
-                    if certificate_enabled:
-                        enriched_details = enrich_certificate_details(
-                            {
-                                "name": pdf_info.get("name", ""),
-                                "school": pdf_info.get("school", ""),
-                                "event_date": pdf_info.get("event_date", ""),
-                                "email": pdf_info.get("email", ""),
-                                "phone": pdf_info.get("phone", ""),
-                            },
-                            source_name=survey_title,
+                    if is_current and current_dataset:
+                        live_contact = recover_contact_from_current_dataset(
+                            current_dataset["raw"],
+                            current_dataset["results"],
+                            pdf_user,
+                            pdf_info,
+                            certificate_overrides=certificate_overrides,
                         )
-                        for field in ("name", "school", "event_date", "email", "phone"):
-                            if enriched_details.get(field, "") != pdf_info.get(field, ""):
-                                pdf_info[field] = enriched_details.get(field, "")
-                                library_updated = True
+                        if any(
+                            live_contact.get(field, "") != str(pdf_info.get(field, "") or "").strip()
+                            for field in ("email", "name", "school", "event_date", "phone", "event_name")
+                        ):
+                            for field in ("email", "name", "school", "event_date", "phone", "event_name"):
+                                live_value = live_contact.get(field, "")
+                                if live_value or not str(pdf_info.get(field, "") or "").strip():
+                                    pdf_info[field] = live_value
+                            library_updated = True
+                    recovered_contact = recover_library_record_contact(library_key, survey_title, pdf_user, pdf_info)
+                    if any(
+                        recovered_contact.get(field, "") != str(pdf_info.get(field, "") or "").strip()
+                        for field in ("email", "name", "school", "event_date", "phone", "event_name")
+                    ):
+                        for field in ("email", "name", "school", "event_date", "phone", "event_name"):
+                            pdf_info[field] = recovered_contact.get(field, "")
+                        library_updated = True
+                    if certificate_enabled:
+                        needs_enrichment = any(
+                            not str(pdf_info.get(field, "") or "").strip()
+                            for field in ("school", "event_date")
+                        ) or is_fallback_event_name(pdf_info.get("event_name", ""), survey_title)
+                        if needs_enrichment:
+                            enriched_details = enrich_certificate_details(
+                                {
+                                    "name": pdf_info.get("name", ""),
+                                    "school": pdf_info.get("school", ""),
+                                    "event_date": pdf_info.get("event_date", ""),
+                                    "email": pdf_info.get("email", ""),
+                                    "phone": pdf_info.get("phone", ""),
+                                    "event_name": pdf_info.get("event_name", ""),
+                                },
+                                source_name=survey_title,
+                            )
+                            for field in ("name", "school", "event_date", "email", "phone", "event_name"):
+                                if enriched_details.get(field, "") != pdf_info.get(field, ""):
+                                    pdf_info[field] = enriched_details.get(field, "")
+                                    library_updated = True
                     pdf_label = resolve_record_display_name(
                         {"name": pdf_info.get("name", ""), "email": pdf_info.get("email", ""), "UserID": pdf_user},
                         fallback=pdf_user,
                     )
-                    if certificate_enabled:
+                    if report_type == "certificate_only":
+                        label_col, download_col, cert_col = st.columns([1.4, 1, 1])
+                    elif certificate_enabled:
                         label_col, download_col, send_col, cert_col = st.columns([1.4, 1, 1, 1])
                     else:
                         label_col, download_col, send_col = st.columns([1.4, 1, 1])
@@ -1313,41 +1918,45 @@ def render_generated_pdf_library(container, report_type="single"):
                         )
                     with download_col:
                         st.download_button(
-                            label="Download Report",
+                            label="Download Certificate" if report_type == "certificate_only" else "Download Report",
                             data=Path(pdf_info["file_path"]).read_bytes(),
                             file_name=pdf_info["file_name"],
                             mime="application/pdf",
                             use_container_width=True,
                             key=f"download_{library_key}_{pdf_user}",
                         )
-                    with send_col:
-                        send_disabled = not pdf_info.get("email")
-                        if st.button(
-                            "Send Email",
-                            use_container_width=True,
-                            key=f"send_{library_key}_{pdf_user}",
-                            disabled=send_disabled,
-                        ):
-                            try:
-                                from send_pending_reports import send_email_with_attachment
+                    if report_type != "certificate_only":
+                        with send_col:
+                            recipient_email = normalize_email_value(pdf_info.get("email", ""))
+                            send_disabled = not recipient_email
+                            if st.button(
+                                "Send Email",
+                                use_container_width=True,
+                                key=f"send_{library_key}_{pdf_user}",
+                                disabled=send_disabled,
+                            ):
+                                try:
+                                    from send_pending_reports import send_email_with_attachment
 
-                                response = send_email_with_attachment(
-                                    email=pdf_info["email"],
-                                    name=pdf_label,
-                                    file_name=pdf_info["file_name"],
-                                    file_bytes=Path(pdf_info["file_path"]).read_bytes(),
-                                )
-                                if response.status_code in (200, 201):
-                                    st.success(f"Sent {pdf_label} to {pdf_info['email']}")
-                                else:
-                                    st.error(
-                                        f"Failed for {pdf_label} ({response.status_code}): {response.text[:200]}"
-                                    )
-                            except Exception as e:
-                                st.error(f"Send failed for {pdf_label}: {e}")
+                                    with st.spinner(f"Sending {pdf_label} to {recipient_email}..."):
+                                        response = send_email_with_attachment(
+                                            email=recipient_email,
+                                            name=pdf_label,
+                                            file_name=pdf_info["file_name"],
+                                            file_bytes=Path(pdf_info["file_path"]).read_bytes(),
+                                        )
+                                    if response.status_code in (200, 201):
+                                        st.success(f"Sent {pdf_label} to {recipient_email}")
+                                    else:
+                                        st.error(
+                                            f"Failed for {pdf_label} ({response.status_code}): {response.text[:200]}"
+                                        )
+                                except Exception as e:
+                                    st.error(f"Send failed for {pdf_label}: {e}")
                     if certificate_enabled:
                         with cert_col:
-                            send_cert_disabled = not pdf_info.get("email")
+                            cert_recipient_email = normalize_email_value(pdf_info.get("email", ""))
+                            send_cert_disabled = not cert_recipient_email
                             if st.button(
                                 "Send Certificate",
                                 use_container_width=True,
@@ -1357,22 +1966,44 @@ def render_generated_pdf_library(container, report_type="single"):
                                 try:
                                     from send_pending_reports import send_certificate_email_with_attachment
 
-                                    certificate_bytes = generate_certificate_pdf_playwright(
-                                        pdf_label,
-                                        school_name=pdf_info.get("school", ""),
-                                        event_date=pdf_info.get("event_date", ""),
-                                        workshop_title="Competency Based Assessment Session",
-                                    )
-                                    certificate_name = f"Participation_Certificate_{'_'.join(pdf_label.split())}.pdf"
-                                    response = send_certificate_email_with_attachment(
-                                        email=pdf_info["email"],
-                                        name=pdf_label,
-                                        file_name=certificate_name,
-                                        file_bytes=certificate_bytes,
-                                        event_date=pdf_info.get("event_date", ""),
-                                    )
+                                    with st.spinner(f"Sending certificate to {cert_recipient_email}..."):
+                                        certificate_details = enrich_certificate_details(
+                                            {
+                                                "name": pdf_label,
+                                                "school": pdf_info.get("school", ""),
+                                                "event_date": pdf_info.get("event_date", ""),
+                                                "email": cert_recipient_email,
+                                                "phone": pdf_info.get("phone", ""),
+                                                "event_name": pdf_info.get("event_name", ""),
+                                            },
+                                            source_name=survey_title,
+                                        )
+                                        override_event_name = str(certificate_overrides.get("event_name", "") or "").strip()
+                                        override_event_date = str(certificate_overrides.get("event_date", "") or "").strip()
+                                        if is_current and override_event_name:
+                                            certificate_details["event_name"] = override_event_name
+                                        if is_current and override_event_date:
+                                            certificate_details["event_date"] = override_event_date
+                                        certificate_bytes = generate_certificate_pdf_playwright(
+                                            certificate_details.get("name", pdf_label),
+                                            school_name=certificate_details.get("school", ""),
+                                            event_date=certificate_details.get("event_date", ""),
+                                            event_name=certificate_details.get("event_name", ""),
+                                            workshop_title="Competency Based Assessment Session",
+                                        )
+                                        certificate_name = (
+                                            f"{slugify_filename_part(certificate_details.get('event_name', '') or 'Participation_Certificate')}"
+                                            f"_Certificate_{slugify_filename_part(pdf_label)}.pdf"
+                                        )
+                                        response = send_certificate_email_with_attachment(
+                                            email=cert_recipient_email,
+                                            name=pdf_label,
+                                            file_name=certificate_name,
+                                            file_bytes=certificate_bytes,
+                                            event_date=pdf_info.get("event_date", ""),
+                                        )
                                     if response.status_code in (200, 201):
-                                        st.success(f"Sent certificate to {pdf_info['email']}")
+                                        st.success(f"Sent certificate to {cert_recipient_email}")
                                     else:
                                         st.error(
                                             f"Certificate send failed for {pdf_label} ({response.status_code}): {response.text[:200]}"
@@ -1466,6 +2097,91 @@ def render_saved_library_bulk_email_panel(report_type, key_prefix):
                         st.write(f"- {line}")
             except Exception as e:
                 st.error(f"Bulk email failed for {library['source_name']}: {e}")
+
+
+def render_saved_library_bulk_certificate_panel(report_type, key_prefix):
+    libraries = list_all_pdf_libraries(report_type=report_type)
+    if not libraries:
+        st.info("No generated certificate libraries are available for bulk send yet.")
+        return
+
+    progress_panel = st.empty()
+    status_panel = st.empty()
+    log_panel = st.empty()
+
+    for library in libraries:
+        email_ready_records = {
+            user_id: record
+            for user_id, record in library["records"].items()
+            if record.get("email") and Path(record["file_path"]).exists()
+        }
+        card_col, action_col = st.columns([1.4, 1])
+        with card_col:
+            st.markdown(
+                f"""
+                <div class="explain-wrap" style="margin-bottom: 0.75rem;">
+                    <div class="explain-sub">Saved Survey</div>
+                    <div style="font-size:1rem; color:#0f172a; font-weight:700;">{library['source_name']}</div>
+                    <div style="font-size:0.9rem; color:#64748b; margin-top:0.35rem;">Generated certificates: {len(library['records'])}</div>
+                    <div style="font-size:0.85rem; color:#64748b; margin-top:0.25rem;">Email-ready certificates: {len(email_ready_records)}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with action_col:
+            send_bulk_for_library = st.button(
+                "Send Bulk Certificates",
+                use_container_width=True,
+                disabled=not email_ready_records,
+                key=f"{key_prefix}_bulk_certificate_{library['library_key']}",
+            )
+
+        if send_bulk_for_library:
+            try:
+                from send_pending_reports import send_certificate_email_with_attachment
+
+                sent_count = 0
+                failed_count = 0
+                run_log = []
+                total_targets = len(email_ready_records)
+
+                for index, (user_id, record) in enumerate(email_ready_records.items(), start=1):
+                    status_panel.info(f"{index}/{total_targets}: Sending certificate to {user_id}")
+                    progress_panel.progress(
+                        index / max(total_targets, 1),
+                        text=f"Sending certificates: {index}/{total_targets}",
+                    )
+                    try:
+                        response = send_certificate_email_with_attachment(
+                            email=record["email"],
+                            name=record.get("name", user_id),
+                            file_name=record["file_name"],
+                            file_bytes=Path(record["file_path"]).read_bytes(),
+                            event_date=record.get("event_date", ""),
+                        )
+                        if response.status_code in (200, 201):
+                            sent_count += 1
+                            run_log.append(f"Sent: {user_id} ({record['email']})")
+                        else:
+                            failed_count += 1
+                            run_log.append(f"Failed: {user_id} ({response.status_code})")
+                    except Exception as e:
+                        failed_count += 1
+                        run_log.append(f"Failed: {user_id} ({e})")
+
+                if sent_count:
+                    st.success(f"Sent {sent_count} certificate email(s) from {library['source_name']}.")
+                if failed_count:
+                    st.error(f"{failed_count} certificate email(s) failed for {library['source_name']}.")
+                status_panel.success(
+                    f"Completed certificate run for {library['source_name']}: {sent_count} sent, {failed_count} failed."
+                )
+                with log_panel.container():
+                    st.markdown("**Recent Certificate Activity**")
+                    for line in run_log[-10:]:
+                        st.write(f"- {line}")
+            except Exception as e:
+                st.error(f"Bulk certificate send failed for {library['source_name']}: {e}")
 
 
 PRE_ASSESSMENT_KEY = {
@@ -3604,20 +4320,41 @@ def generate_user_pdf_playwright(row):
         return pdf_bytes
 
 
-def build_assessment_pdf_filename(name, survey_kind):
-    safe_name = "_".join(str(name or "Participant").split())
+def build_assessment_pdf_filename(name, survey_kind, event_name=""):
+    safe_name = slugify_filename_part(name or "Participant")
+    safe_event = slugify_filename_part(event_name or "")
     prefix = "PreAssessment" if survey_kind == "pre_assessment" else "PostAssessment"
+    if safe_event:
+        return f"{safe_event}_{safe_name}.pdf"
     return f"{prefix}_{safe_name}.pdf"
 
 
-def render_assessment_single_report(raw, uploaded_file, current_library_key, survey_kind):
+def build_certificate_pdf_filename(name, event_name=""):
+    safe_name = slugify_filename_part(name or "Participant")
+    safe_event = slugify_filename_part(event_name or "")
+    if safe_event:
+        return f"{safe_event}_Certificate_{safe_name}.pdf"
+    return f"Participation_Certificate_{safe_name}.pdf"
+
+
+def render_assessment_single_report(raw, uploaded_file, current_library_key, survey_kind, certificate_overrides=None):
     api_key = os.getenv("GEMINI_API_KEY")
     answer_key = PRE_ASSESSMENT_KEY if survey_kind == "pre_assessment" else POST_ASSESSMENT_KEY
     survey_title = "Pre Assessment Survey" if survey_kind == "pre_assessment" else "Post Assessment Survey"
+    certificate_overrides = certificate_overrides or {}
 
     results, dynamic_answer_key = prepare_assessment_results(raw, answer_key, api_key)
     question_metrics_df = get_question_metrics(raw, dynamic_answer_key, answer_key)
     participant_scores = get_participant_scores(raw, dynamic_answer_key)
+    st.session_state.generated_pdfs, library_updated = backfill_library_from_current_dataset(
+        raw,
+        results,
+        st.session_state.generated_pdfs,
+        survey_kind=survey_kind,
+        certificate_overrides=certificate_overrides,
+    )
+    if library_updated:
+        persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
     status_col = find_column_name(raw, ["status", "mail status", "email status"])
     pending_count = raw[status_col].astype(str).str.strip().eq("Pending").sum() if status_col is not None else len(raw)
 
@@ -3627,6 +4364,12 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
         st.caption(f"Uploaded list rows: {len(results)}")
         st.caption(f"Pending email rows: {pending_count}")
         st.caption(f"Detected survey: {survey_title}")
+        if certificate_overrides.get("event_name") or certificate_overrides.get("event_date"):
+            st.caption(
+                "Certificate defaults: "
+                f"{certificate_overrides.get('event_name', 'No event name')} · "
+                f"{certificate_overrides.get('event_date', 'No event date')}"
+            )
 
     row = results[results["UserID"] == user_choice].iloc[0].copy()
     for i, question in enumerate(answer_key.keys(), start=1):
@@ -3719,8 +4462,17 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
                         participant_scores,
                         answer_key,
                     )
-                    file_name = build_assessment_pdf_filename(user_choice, survey_kind)
-                    certificate = get_row_certificate_details(raw, results, user_choice)
+                    certificate = get_row_certificate_details_with_overrides(
+                        raw,
+                        results,
+                        user_choice,
+                        certificate_overrides,
+                    )
+                    file_name = build_assessment_pdf_filename(
+                        user_choice,
+                        survey_kind,
+                        certificate.get("event_name", ""),
+                    )
                     st.session_state.generated_pdfs[user_choice] = save_generated_pdf_record(
                         user_choice,
                         file_name,
@@ -3731,6 +4483,7 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
                         school=certificate.get("school", ""),
                         event_date=certificate.get("event_date", ""),
                         phone=certificate.get("phone", ""),
+                        event_name=certificate.get("event_name", ""),
                     )
                     persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
                     report_status_panel.success(f"Recompiled PDF for {row['Display_Name']}.")
@@ -3754,6 +4507,12 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
                     record = report_row.copy()
                     for i, question in enumerate(answer_key.keys(), start=1):
                         record[f"QuestionText{i}"] = question
+                    row_certificate = get_row_certificate_details_with_overrides(
+                        raw,
+                        results,
+                        report_row["UserID"],
+                        certificate_overrides,
+                    )
                     pdf_bytes = generate_assessment_pdf_playwright(
                         record,
                         survey_title,
@@ -3763,14 +4522,19 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
                     )
                     st.session_state.generated_pdfs[report_row["UserID"]] = save_generated_pdf_record(
                         report_row["UserID"],
-                        build_assessment_pdf_filename(current_name, survey_kind),
+                        build_assessment_pdf_filename(
+                            current_name,
+                            survey_kind,
+                            row_certificate.get("event_name", ""),
+                        ),
                         pdf_bytes,
                         current_library_key,
                         email=report_row.get("Email", ""),
                         name=current_name,
-                        school=get_row_certificate_details(raw, results, report_row["UserID"]).get("school", ""),
-                        event_date=get_row_certificate_details(raw, results, report_row["UserID"]).get("event_date", ""),
-                        phone=get_row_certificate_details(raw, results, report_row["UserID"]).get("phone", ""),
+                        school=row_certificate.get("school", ""),
+                        event_date=row_certificate.get("event_date", ""),
+                        phone=row_certificate.get("phone", ""),
+                        event_name=row_certificate.get("event_name", ""),
                     )
                     generated_count += 1
                     render_progress_metric(assessment_progress_panel, generated_count, len(results))
@@ -3789,7 +4553,11 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
             for line in st.session_state.pdf_batch_log[-10:]:
                 st.write(f"- {line}")
         library_panel = st.empty()
-        render_generated_pdf_library(library_panel, report_type="single")
+        render_generated_pdf_library(
+            library_panel,
+            report_type="single",
+            current_dataset={"raw": raw, "results": results},
+        )
 
     with email_tab:
         st.markdown(section_header("03", "Email Delivery"), unsafe_allow_html=True)
@@ -3802,6 +4570,275 @@ def render_assessment_single_report(raw, uploaded_file, current_library_key, sur
                     st.success("Completed email run.")
                 except Exception as e:
                     st.error(f"Email sending failed: {e}")
+        if st.session_state.email_batch_log:
+            for line in st.session_state.email_batch_log[-10:]:
+                st.write(f"- {line}")
+
+
+def render_certificate_only_report(raw, uploaded_file, current_library_key):
+    results = prepare_certificate_only_results(raw)
+    st.session_state.generated_pdfs, library_updated = backfill_library_from_current_dataset(
+        raw,
+        results,
+        st.session_state.generated_pdfs,
+        survey_kind="certificate_only",
+    )
+    if library_updated:
+        persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
+
+    pending_count = len(results)
+
+    with st.sidebar:
+        st.markdown("---")
+        user_choice = st.selectbox("Select Certificate Recipient", results["UserID"].tolist())
+        st.caption(f"Uploaded list rows: {len(results)}")
+        st.caption(f"Pending certificate emails: {pending_count}")
+        st.caption("School name will be fetched from the database using email/phone.")
+
+    row = results[results["UserID"] == user_choice].iloc[0]
+    single_existing_pdf = st.session_state.generated_pdfs.get(user_choice)
+    saved_pdf_count = len(st.session_state.generated_pdfs)
+
+    render_panel_header(
+        "Certificate Only",
+        "Certificate Delivery Workspace",
+        "Upload a simple participant CSV, generate participation certificates, and send certificate emails from the same workspace.",
+    )
+    top_a, top_b, top_c, top_d = st.columns(4)
+    with top_a:
+        render_small_metric("Participants", len(results))
+    with top_b:
+        certificate_progress_panel = st.empty()
+        render_progress_metric(certificate_progress_panel, saved_pdf_count, len(results))
+    with top_c:
+        render_small_metric("Pending Certificates", pending_count)
+    with top_d:
+        render_small_metric("Survey Type", "Certificate Only")
+
+    report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
+
+    with report_tab:
+        action_col, helper_col = st.columns([1.2, 1])
+        report_status_panel = st.empty()
+        with action_col:
+            generate_single_certificate = False
+            if single_existing_pdf and Path(single_existing_pdf["file_path"]).exists():
+                download_col, recompile_col = st.columns(2)
+                with download_col:
+                    st.download_button(
+                        "Download Compiled Certificate",
+                        Path(single_existing_pdf["file_path"]).read_bytes(),
+                        single_existing_pdf["file_name"],
+                        "application/pdf",
+                        use_container_width=True,
+                        key=f"certificate_only_download_compiled_{user_choice}",
+                    )
+                with recompile_col:
+                    generate_single_certificate = st.button(
+                        "Recompile Certificate",
+                        type="primary",
+                        use_container_width=True,
+                        key=f"certificate_only_recompile_{user_choice}",
+                    )
+            else:
+                generate_single_certificate = st.button(
+                    "Compile Selected Certificate",
+                    type="primary",
+                    use_container_width=True,
+                    key=f"certificate_only_compile_{user_choice}",
+                )
+        with helper_col:
+            render_info_card(
+                "Certificate Inputs",
+                "This mode uses only the uploaded participant fields for name, email, phone, event name, and event date. School name is enriched from the database before the certificate is generated.",
+            )
+
+        certificate_details = enrich_certificate_details(
+            {
+                "name": row["Display_Name"],
+                "email": row.get("Email", ""),
+                "phone": row.get("Phone", ""),
+                "event_name": row.get("Event_Name", ""),
+                "event_date": row.get("Event_Date", ""),
+                "school": "",
+            },
+            source_name=uploaded_file.name,
+        )
+
+        st.markdown(section_header("01", certificate_details.get("name", row["Display_Name"])), unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Email", certificate_details.get("email", "") or "-")
+        m2.metric("Phone", certificate_details.get("phone", "") or "-")
+        m3.metric("Event Name", certificate_details.get("event_name", "") or "-")
+        m4.metric("Event Date", certificate_details.get("event_date", "") or "-")
+        st.caption(f"School from DB: {certificate_details.get('school', '') or 'Not found'}")
+
+        if generate_single_certificate:
+            report_status_panel.info(f"Compiling certificate for {certificate_details.get('name', row['Display_Name'])}...")
+            with st.spinner("Rendering certificate PDF..."):
+                try:
+                    pdf_bytes = generate_certificate_pdf_playwright(
+                        certificate_details.get("name", row["Display_Name"]),
+                        school_name=certificate_details.get("school", ""),
+                        event_date=certificate_details.get("event_date", ""),
+                        event_name=certificate_details.get("event_name", ""),
+                        workshop_title="Participation Certificate",
+                    )
+                    file_name = build_certificate_pdf_filename(
+                        certificate_details.get("name", row["Display_Name"]),
+                        certificate_details.get("event_name", ""),
+                    )
+                    st.session_state.generated_pdfs[user_choice] = save_generated_pdf_record(
+                        user_choice,
+                        file_name,
+                        pdf_bytes,
+                        current_library_key,
+                        email=certificate_details.get("email", ""),
+                        name=certificate_details.get("name", row["Display_Name"]),
+                        school=certificate_details.get("school", ""),
+                        event_date=certificate_details.get("event_date", ""),
+                        phone=certificate_details.get("phone", ""),
+                        event_name=certificate_details.get("event_name", ""),
+                    )
+                    persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
+                    report_status_panel.success(f"Compiled certificate for {certificate_details.get('name', row['Display_Name'])}.")
+                    st.rerun()
+                except Exception as e:
+                    report_status_panel.error(f"Certificate compile failed for {certificate_details.get('name', row['Display_Name'])}: {e}")
+
+    with pdf_tab:
+        st.markdown(section_header("02", "PDF Library"), unsafe_allow_html=True)
+        if st.button("Generate Certificates For All Rows", use_container_width=True, key="certificate_only_batch_pdf"):
+            st.session_state.generated_pdfs = {}
+            clear_generated_pdf_library(current_library_key)
+            render_progress_metric(certificate_progress_panel, 0, len(results))
+            batch_log = []
+            generated_count = 0
+            for position, (_, report_row) in enumerate(results.iterrows(), start=1):
+                current_name = resolve_record_display_name(report_row, fallback=f"User {position}")
+                try:
+                    row_details = enrich_certificate_details(
+                        {
+                            "name": current_name,
+                            "email": report_row.get("Email", ""),
+                            "phone": report_row.get("Phone", ""),
+                            "event_name": report_row.get("Event_Name", ""),
+                            "event_date": report_row.get("Event_Date", ""),
+                            "school": "",
+                        },
+                        source_name=uploaded_file.name,
+                    )
+                    pdf_bytes = generate_certificate_pdf_playwright(
+                        row_details.get("name", current_name),
+                        school_name=row_details.get("school", ""),
+                        event_date=row_details.get("event_date", ""),
+                        event_name=row_details.get("event_name", ""),
+                        workshop_title="Participation Certificate",
+                    )
+                    st.session_state.generated_pdfs[report_row["UserID"]] = save_generated_pdf_record(
+                        report_row["UserID"],
+                        build_certificate_pdf_filename(
+                            row_details.get("name", current_name),
+                            row_details.get("event_name", ""),
+                        ),
+                        pdf_bytes,
+                        current_library_key,
+                        email=row_details.get("email", ""),
+                        name=row_details.get("name", current_name),
+                        school=row_details.get("school", ""),
+                        event_date=row_details.get("event_date", ""),
+                        phone=row_details.get("phone", ""),
+                        event_name=row_details.get("event_name", ""),
+                    )
+                    generated_count += 1
+                    render_progress_metric(certificate_progress_panel, generated_count, len(results))
+                    batch_log.append(f"{position}/{len(results)} generated: {row_details.get('name', current_name)}")
+                except Exception as e:
+                    render_progress_metric(certificate_progress_panel, generated_count, len(results))
+                    batch_log.append(f"{position}/{len(results)} failed: {current_name} ({e})")
+            persist_generated_pdf_library(st.session_state.generated_pdfs, current_library_key)
+            st.session_state.pdf_batch_log = batch_log
+            st.success("Batch certificate generation finished.")
+        if st.button("Clear Generated PDF List", use_container_width=True, key="certificate_only_clear_pdf"):
+            st.session_state.generated_pdfs = {}
+            clear_generated_pdf_library(current_library_key)
+            st.success("Cleared generated PDF list.")
+        if st.session_state.pdf_batch_log:
+            for line in st.session_state.pdf_batch_log[-10:]:
+                st.write(f"- {line}")
+        library_panel = st.empty()
+        render_generated_pdf_library(
+            library_panel,
+            report_type="certificate_only",
+            current_dataset={"raw": raw, "results": results},
+        )
+
+    with email_tab:
+        st.markdown(section_header("03", "Email Delivery"), unsafe_allow_html=True)
+        if st.button("Send Bulk Certificates", use_container_width=True, key="certificate_only_bulk_email"):
+            progress_panel = st.empty()
+            status_panel = st.empty()
+            run_log = []
+            total_targets = len(results)
+            try:
+                from send_pending_reports import send_certificate_email_with_attachment
+
+                sent_count = 0
+                failed_count = 0
+                for index, (_, report_row) in enumerate(results.iterrows(), start=1):
+                    row_details = enrich_certificate_details(
+                        {
+                            "name": resolve_record_display_name(report_row, fallback=f"User {index}"),
+                            "email": report_row.get("Email", ""),
+                            "phone": report_row.get("Phone", ""),
+                            "event_name": report_row.get("Event_Name", ""),
+                            "event_date": report_row.get("Event_Date", ""),
+                            "school": "",
+                        },
+                        source_name=uploaded_file.name,
+                    )
+                    recipient_email = normalize_email_value(row_details.get("email", ""))
+                    status_panel.info(f"{index}/{total_targets}: Sending certificate to {row_details.get('name', '')}")
+                    progress_panel.progress(index / max(total_targets, 1), text=f"Sending certificates: {index}/{total_targets}")
+                    if not recipient_email:
+                        failed_count += 1
+                        run_log.append(f"Failed: {row_details.get('name', '')} (No email found)")
+                        continue
+                    try:
+                        pdf_bytes = generate_certificate_pdf_playwright(
+                            row_details.get("name", ""),
+                            school_name=row_details.get("school", ""),
+                            event_date=row_details.get("event_date", ""),
+                            event_name=row_details.get("event_name", ""),
+                            workshop_title="Participation Certificate",
+                        )
+                        response = send_certificate_email_with_attachment(
+                            email=recipient_email,
+                            name=row_details.get("name", ""),
+                            file_name=build_certificate_pdf_filename(
+                                row_details.get("name", ""),
+                                row_details.get("event_name", ""),
+                            ),
+                            file_bytes=pdf_bytes,
+                            event_date=row_details.get("event_date", ""),
+                        )
+                        if response.status_code in (200, 201):
+                            sent_count += 1
+                            run_log.append(f"Sent: {row_details.get('name', '')} ({recipient_email})")
+                        else:
+                            failed_count += 1
+                            run_log.append(f"Failed: {row_details.get('name', '')} ({response.status_code})")
+                    except Exception as e:
+                        failed_count += 1
+                        run_log.append(f"Failed: {row_details.get('name', '')} ({e})")
+
+                st.session_state.email_batch_log = run_log
+                if sent_count:
+                    st.success(f"Sent {sent_count} certificate email(s).")
+                if failed_count:
+                    st.error(f"{failed_count} certificate email(s) failed.")
+            except Exception as e:
+                st.error(f"Certificate sending failed: {e}")
         if st.session_state.email_batch_log:
             for line in st.session_state.email_batch_log[-10:]:
                 st.write(f"- {line}")
@@ -3832,11 +4869,11 @@ def run_app():
 
         report_mode = st.radio(
             "Report Type",
-            ["Single Report", "Pre/Post Comparison"],
+            ["Single Report", "Pre/Post Comparison", "Certificate Only"],
             horizontal=True,
         )
 
-        if report_mode == "Single Report":
+        if report_mode in {"Single Report", "Certificate Only"}:
             uploaded_file = st.file_uploader("Upload Response CSV", type=["csv"])
         else:
             uploaded_file = None
@@ -3848,35 +4885,54 @@ def run_app():
     if not uploaded_file:
         st.session_state.current_library_key = None
         st.session_state.generated_pdfs = {}
-        render_panel_header(
-            "Single Report",
-            "R-Cube Strategic Command Centre",
-            "Upload one survey CSV to review individual reports, generate a PDF library, and send emails from one place.",
+        mode_title = "Certificate Only" if report_mode == "Certificate Only" else "Single Report"
+        mode_heading = "Certificate Delivery Workspace" if report_mode == "Certificate Only" else "R-Cube Strategic Command Centre"
+        mode_description = (
+            "Upload a participant CSV with name, email, phone, event name, and event date to generate and send certificates."
+            if report_mode == "Certificate Only"
+            else "Upload one survey CSV to review individual reports, generate a PDF library, and send emails from one place."
         )
+        render_panel_header(mode_title, mode_heading, mode_description)
         report_tab, pdf_tab, email_tab = st.tabs(["Report", "PDF Library", "Email Delivery"])
         with report_tab:
             render_info_card(
                 "Get Started",
-                "Upload your survey CSV to unlock the individual report view and generate new PDFs for selected users.",
+                "Upload your participant CSV to unlock certificate generation and certificate email delivery."
+                if report_mode == "Certificate Only"
+                else "Upload your survey CSV to unlock the individual report view and generate new PDFs for selected users.",
             )
         with pdf_tab:
             render_info_card(
                 "Saved Reports",
-                "Previously generated PDFs stay visible here even when no survey is uploaded. Upload a CSV only when you want to generate new reports.",
+                "Previously generated certificate PDFs stay visible here even when no CSV is uploaded."
+                if report_mode == "Certificate Only"
+                else "Previously generated PDFs stay visible here even when no survey is uploaded. Upload a CSV only when you want to generate new reports.",
             )
             library_panel = st.empty()
-            render_generated_pdf_library(library_panel, report_type="single")
+            render_generated_pdf_library(
+                library_panel,
+                report_type="certificate_only" if report_mode == "Certificate Only" else "single",
+            )
         with email_tab:
             render_info_card(
                 "Email Delivery",
-                "You can bulk-send from any saved survey library below, even without uploading a new CSV. Upload a survey CSV only when you want to generate fresh reports first.",
+                "You can bulk-send certificates from any saved certificate library below, even without uploading a new CSV."
+                if report_mode == "Certificate Only"
+                else "You can bulk-send from any saved survey library below, even without uploading a new CSV. Upload a survey CSV only when you want to generate fresh reports first.",
             )
-            render_saved_library_bulk_email_panel("single", "single_saved")
+            if report_mode == "Certificate Only":
+                render_saved_library_bulk_certificate_panel("certificate_only", "certificate_saved")
+            else:
+                render_saved_library_bulk_email_panel("single", "single_saved")
         return
 
     uploaded_file_bytes = uploaded_file.getvalue()
     current_library_key = build_library_key(uploaded_file.name, uploaded_file_bytes)
-    persist_library_meta(current_library_key, uploaded_file.name)
+    persist_library_meta(
+        current_library_key,
+        uploaded_file.name,
+        report_type="certificate_only" if report_mode == "Certificate Only" else "single",
+    )
     if st.session_state.get("current_library_key") != current_library_key:
         st.session_state.current_library_key = current_library_key
         st.session_state.generated_pdfs = load_generated_pdf_library(current_library_key)
@@ -3884,9 +4940,51 @@ def run_app():
         st.session_state.pdf_progress = {"current": 0, "total": 0, "message": "", "active": False}
 
     raw = pd.read_csv(io.BytesIO(uploaded_file_bytes))
+    if report_mode == "Certificate Only":
+        render_certificate_only_report(raw, uploaded_file, current_library_key)
+        st.markdown("""<div style='margin-top: 1rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-family: DM Mono, monospace; font-size: 0.6rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; text-align: center;'>R-Cube Screening Metric · EDXSO Strategic Intelligence · Certificate Tool</div>""", unsafe_allow_html=True)
+        return
     survey_kind = infer_single_survey_kind(raw)
     if survey_kind in {"pre_assessment", "post_assessment"}:
-        render_assessment_single_report(raw, uploaded_file, current_library_key, survey_kind)
+        date_col = find_date_column(raw)
+        default_certificate_date = ""
+        if date_col is not None and date_col in raw.columns and not raw.empty:
+            default_certificate_date = format_event_date(raw.iloc[0][date_col])
+        inferred_event_name = infer_event_name_from_source_name(uploaded_file.name)
+        event_name_state_key = f"certificate_event_name_{current_library_key}"
+        event_date_state_key = f"certificate_event_date_{current_library_key}"
+        with st.sidebar:
+            st.markdown("---")
+            st.markdown(
+                """
+                <div style='font-family: DM Mono, monospace; font-size: 0.7rem; color: #64748b; letter-spacing: 0.2em; text-transform: uppercase; margin-bottom: 0.5rem;'>
+                    Certificate Details
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            certificate_event_name = st.text_input(
+                "Certificate Event Name",
+                value=st.session_state.get(event_name_state_key, inferred_event_name),
+                help="Used in certificate PDFs and certificate emails for this uploaded survey.",
+            )
+            certificate_event_date = st.text_input(
+                "Certificate Event Date",
+                value=st.session_state.get(event_date_state_key, default_certificate_date),
+                help="Used in certificate PDFs and certificate emails for this uploaded survey.",
+            )
+        st.session_state[event_name_state_key] = certificate_event_name
+        st.session_state[event_date_state_key] = certificate_event_date
+        render_assessment_single_report(
+            raw,
+            uploaded_file,
+            current_library_key,
+            survey_kind,
+            certificate_overrides={
+                "event_name": certificate_event_name,
+                "event_date": certificate_event_date,
+            },
+        )
         st.markdown("""<div style='margin-top: 1rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-family: DM Mono, monospace; font-size: 0.6rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; text-align: center;'>R-Cube Screening Metric · EDXSO Strategic Intelligence · Screening Tool</div>""", unsafe_allow_html=True)
         return
 
@@ -4014,9 +5112,9 @@ def run_app():
                         "active": True,
                     }
                     pdf_bytes = generate_user_pdf_playwright(row)
-                    file_name = build_pdf_filename(user_choice)
                     contact = get_row_contact_details(raw, results, user_choice)
                     certificate = get_row_certificate_details(raw, results, user_choice)
+                    file_name = build_pdf_filename(user_choice, certificate.get("event_name", ""))
                     st.session_state.generated_pdfs[user_choice] = save_generated_pdf_record(
                         user_choice,
                         file_name,
@@ -4027,6 +5125,7 @@ def run_app():
                         school=certificate.get("school", ""),
                         event_date=certificate.get("event_date", ""),
                         phone=certificate.get("phone", ""),
+                        event_name=certificate.get("event_name", ""),
                     )
                     persist_generated_pdf_library(
                         st.session_state.generated_pdfs,
@@ -4115,7 +5214,7 @@ def run_app():
                     certificate = get_row_certificate_details(raw, results, pdf_user)
                     st.session_state.generated_pdfs[pdf_user] = save_generated_pdf_record(
                         pdf_user,
-                        build_pdf_filename(current_name),
+                        build_pdf_filename(current_name, certificate.get("event_name", "")),
                         pdf_bytes,
                         st.session_state.current_library_key,
                         email=contact["email"],
@@ -4126,6 +5225,7 @@ def run_app():
                         school=certificate.get("school", ""),
                         event_date=certificate.get("event_date", ""),
                         phone=certificate.get("phone", ""),
+                        event_name=certificate.get("event_name", ""),
                     )
                     persist_generated_pdf_library(
                         st.session_state.generated_pdfs,
@@ -4134,7 +5234,6 @@ def run_app():
                     generated_count += 1
                     render_progress_metric(single_progress_panel, generated_count, total_reports)
                     batch_log.append(f"{position}/{total_reports} generated: {current_name}")
-                    render_generated_pdf_library(generated_list_panel, report_type="single")
                 except Exception as e:
                     render_progress_metric(single_progress_panel, generated_count, total_reports)
                     batch_log.append(f"{position}/{total_reports} failed: {current_name} ({e})")
@@ -4154,7 +5253,15 @@ def run_app():
                 for line in st.session_state.pdf_batch_log[-10:]:
                     st.write(f"- {line}")
 
-        render_generated_pdf_library(generated_list_panel, report_type="single")
+        render_generated_pdf_library(
+            generated_list_panel,
+            report_type="single",
+            current_dataset={
+                "raw": raw,
+                "results": results,
+                "certificate_overrides": certificate_overrides,
+            },
+        )
 
     with email_tab:
         email_progress_panel = st.empty()
