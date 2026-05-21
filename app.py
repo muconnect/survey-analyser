@@ -1394,22 +1394,27 @@ def generate_certificate_pdf_playwright(
     school_name = html.escape(str(school_name or "School").strip())
     event_date = html.escape(str(event_date or "").strip())
     event_name = html.escape(str(event_name or workshop_title or "").strip())
-    template_path = Path(__file__).resolve().parent / "assets" / "certificate" / "template.html"
+    assets_root = Path(__file__).resolve().parent / "assets"
+    preferred_certificate_dir = assets_root / "certificate 2"
+    fallback_certificate_dir = assets_root / "certificate"
+    certificate_dir = preferred_certificate_dir if preferred_certificate_dir.exists() else fallback_certificate_dir
+    template_path = certificate_dir / "template.html"
     if template_path.exists():
         html_doc = template_path.read_text()
         html_doc = html_doc.replace("{{LOGO_URI}}", get_edxso_logo_data_uri())
         html_doc = html_doc.replace(
             "{{BACKGROUND_URI}}",
-            file_to_data_uri(Path(__file__).resolve().parent / "assets" / "certificate" / "background.png"),
+            file_to_data_uri(certificate_dir / "background.png"),
         )
         html_doc = html_doc.replace(
             "{{SIGNATURE_URI}}",
-            file_to_data_uri(Path(__file__).resolve().parent / "assets" / "certificate" / "signature.png"),
+            file_to_data_uri(certificate_dir / "signature.png"),
         )
         html_doc = html_doc.replace("{{NAME}}", participant_name)
         html_doc = html_doc.replace("{{SCHOOL}}", school_name)
         html_doc = html_doc.replace("{{DATE}}", event_date)
         html_doc = html_doc.replace("{{EVENT_NAME}}", event_name)
+        html_doc = html_doc.replace("{{EVENT}}", event_name)
     else:
         raise FileNotFoundError(f"Certificate template not found: {template_path}")
 
