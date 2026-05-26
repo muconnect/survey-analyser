@@ -13,6 +13,7 @@ import json
 import re
 import html
 import zipfile
+import csv
 from pathlib import Path
 import requests
 
@@ -106,6 +107,7 @@ def load_local_env(env_path: str = ".env") -> None:
 load_local_env()
 
 GENERATED_PDF_DIR = Path("generated_pdfs")
+MISSING_SCHOOL_LOG_PATH = Path("logs") / "missing_school_teachers.csv"
 EVENT_DATABASE_URL = os.environ.get("EVENT_DATABASE_URL", "").strip()
 SUPABASE_URL = os.environ.get("VITE_SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_API_KEY = (
@@ -2007,6 +2009,18 @@ def render_generated_pdf_library(container, report_type="single", current_datase
                                             certificate_details["event_name"] = override_event_name
                                         if is_current and override_event_date:
                                             certificate_details["event_date"] = override_event_date
+                                        if not has_school_for_delivery(certificate_details):
+                                            log_path = log_missing_school_teacher(
+                                                name=certificate_details.get("name", pdf_label),
+                                                phone=certificate_details.get("phone", ""),
+                                                email=cert_recipient_email,
+                                                source_name=survey_title,
+                                                context="single_send_certificate",
+                                            )
+                                            st.warning(
+                                                f"Skipped certificate for {pdf_label}: school not found in system. Logged in {log_path}."
+                                            )
+                                            continue
                                         certificate_bytes = generate_certificate_pdf_playwright(
                                             certificate_details.get("name", pdf_label),
                                             school_name=certificate_details.get("school", ""),
@@ -2175,12 +2189,36 @@ def render_saved_library_bulk_certificate_panel(report_type, key_prefix):
                         text=f"Sending certificates: {index}/{total_targets}",
                     )
                     try:
+                        record_details = enrich_certificate_details(
+                            {
+                                "name": record.get("name", user_id),
+                                "school": record.get("school", ""),
+                                "event_date": record.get("event_date", ""),
+                                "email": record.get("email", ""),
+                                "phone": record.get("phone", ""),
+                                "event_name": record.get("event_name", ""),
+                            },
+                            source_name=library["source_name"],
+                        )
+                        if not has_school_for_delivery(record_details):
+                            log_path = log_missing_school_teacher(
+                                name=record_details.get("name", user_id),
+                                phone=record_details.get("phone", ""),
+                                email=record.get("email", ""),
+                                source_name=library["source_name"],
+                                context="bulk_saved_certificate",
+                            )
+                            failed_count += 1
+                            run_log.append(
+                                f"Skipped: {user_id} (school not found, logged: {log_path})"
+                            )
+                            continue
                         response = send_certificate_email_with_attachment(
                             email=record["email"],
-                            name=record.get("name", user_id),
+                            name=record_details.get("name", user_id),
                             file_name=record["file_name"],
                             file_bytes=Path(record["file_path"]).read_bytes(),
-                            event_date=record.get("event_date", ""),
+                            event_date=record_details.get("event_date", ""),
                         )
                         if response.status_code in (200, 201):
                             sent_count += 1
@@ -2432,6 +2470,30 @@ def normalize_phone(value):
     if len(digits) > 10:
         digits = digits[-10:]
     return digits
+
+
+def has_school_for_delivery(details):
+    return bool(str((details or {}).get("school", "") or "").strip())
+
+
+def log_missing_school_teacher(name="", phone="", email="", source_name="", context=""):
+    MISSING_SCHOOL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = MISSING_SCHOOL_LOG_PATH.exists()
+    with MISSING_SCHOOL_LOG_PATH.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        if not file_exists:
+            writer.writerow(["timestamp", "name", "phone", "email", "source_name", "context"])
+        writer.writerow(
+            [
+                pd.Timestamp.now().isoformat(),
+                str(name or "").strip(),
+                normalize_phone(phone),
+                normalize_email_value(email),
+                str(source_name or "").strip(),
+                str(context or "").strip(),
+            ]
+        )
+    return str(MISSING_SCHOOL_LOG_PATH)
 
 
 def find_phone_column(df):
@@ -4826,6 +4888,19 @@ def render_certificate_only_report(raw, uploaded_file, current_library_key):
                     if not recipient_email:
                         failed_count += 1
                         run_log.append(f"Failed: {row_details.get('name', '')} (No email found)")
+                        continue
+                    if not has_school_for_delivery(row_details):
+                        log_path = log_missing_school_teacher(
+                            name=row_details.get("name", ""),
+                            phone=row_details.get("phone", ""),
+                            email=recipient_email,
+                            source_name=uploaded_file.name,
+                            context="bulk_certificate_only_send",
+                        )
+                        failed_count += 1
+                        run_log.append(
+                            f"Skipped: {row_details.get('name', '')} (school not found, logged: {log_path})"
+                        )
                         continue
                     try:
                         pdf_bytes = generate_certificate_pdf_playwright(
