@@ -108,6 +108,7 @@ load_local_env()
 
 GENERATED_PDF_DIR = Path("generated_pdfs")
 MISSING_SCHOOL_LOG_PATH = Path("logs") / "missing_school_teachers.csv"
+MISSING_SCHOOL_LOG_RECIPIENT = "shrey@edxso.com"
 EVENT_DATABASE_URL = os.environ.get("EVENT_DATABASE_URL", "").strip()
 SUPABASE_URL = os.environ.get("VITE_SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_API_KEY = (
@@ -1769,11 +1770,21 @@ def clear_generated_pdf_library(library_key):
 
 def build_library_zip_bytes(records):
     zip_buffer = io.BytesIO()
+    used_names = {}
     with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for _, record in records.items():
             file_path = Path(record["file_path"])
             if file_path.exists():
-                zf.write(file_path, arcname=record["file_name"])
+                original_name = str(record.get("file_name", file_path.name))
+                suffix = used_names.get(original_name, 0)
+                if suffix == 0:
+                    arcname = original_name
+                else:
+                    stem = Path(original_name).stem
+                    ext = Path(original_name).suffix
+                    arcname = f"{stem}_{suffix}{ext}"
+                used_names[original_name] = suffix + 1
+                zf.write(file_path, arcname=arcname)
     return zip_buffer.getvalue()
 
 
@@ -2020,31 +2031,31 @@ def render_generated_pdf_library(container, report_type="single", current_datase
                                             st.warning(
                                                 f"Skipped certificate for {pdf_label}: school not found in system. Logged in {log_path}."
                                             )
-                                            continue
-                                        certificate_bytes = generate_certificate_pdf_playwright(
-                                            certificate_details.get("name", pdf_label),
-                                            school_name=certificate_details.get("school", ""),
-                                            event_date=certificate_details.get("event_date", ""),
-                                            event_name=certificate_details.get("event_name", ""),
-                                            workshop_title="Competency Based Assessment Session",
-                                        )
-                                        certificate_name = (
-                                            f"{slugify_filename_part(certificate_details.get('event_name', '') or 'Participation_Certificate')}"
-                                            f"_Certificate_{slugify_filename_part(pdf_label)}.pdf"
-                                        )
-                                        response = send_certificate_email_with_attachment(
-                                            email=cert_recipient_email,
-                                            name=pdf_label,
-                                            file_name=certificate_name,
-                                            file_bytes=certificate_bytes,
-                                            event_date=pdf_info.get("event_date", ""),
-                                        )
-                                    if response.status_code in (200, 201):
-                                        st.success(f"Sent certificate to {cert_recipient_email}")
-                                    else:
-                                        st.error(
-                                            f"Certificate send failed for {pdf_label} ({response.status_code}): {response.text[:200]}"
-                                        )
+                                        else:
+                                            certificate_bytes = generate_certificate_pdf_playwright(
+                                                certificate_details.get("name", pdf_label),
+                                                school_name=certificate_details.get("school", ""),
+                                                event_date=certificate_details.get("event_date", ""),
+                                                event_name=certificate_details.get("event_name", ""),
+                                                workshop_title="Competency Based Assessment Session",
+                                            )
+                                            certificate_name = (
+                                                f"{slugify_filename_part(certificate_details.get('event_name', '') or 'Participation_Certificate')}"
+                                                f"_Certificate_{slugify_filename_part(pdf_label)}.pdf"
+                                            )
+                                            response = send_certificate_email_with_attachment(
+                                                email=cert_recipient_email,
+                                                name=pdf_label,
+                                                file_name=certificate_name,
+                                                file_bytes=certificate_bytes,
+                                                event_date=pdf_info.get("event_date", ""),
+                                            )
+                                            if response.status_code in (200, 201):
+                                                st.success(f"Sent certificate to {cert_recipient_email}")
+                                            else:
+                                                st.error(
+                                                    f"Certificate send failed for {pdf_label} ({response.status_code}): {response.text[:200]}"
+                                                )
                                 except Exception as e:
                                     st.error(f"Certificate send failed for {pdf_label}: {e}")
                 if library_updated:
@@ -2095,6 +2106,7 @@ def render_saved_library_bulk_email_panel(report_type, key_prefix):
                 sent_count = 0
                 failed_count = 0
                 run_log = []
+                skipped_for_missing_school = []
                 total_targets = len(email_ready_records)
 
                 for index, (user_id, record) in enumerate(email_ready_records.items(), start=1):
@@ -2208,6 +2220,15 @@ def render_saved_library_bulk_certificate_panel(report_type, key_prefix):
                                 source_name=library["source_name"],
                                 context="bulk_saved_certificate",
                             )
+                            skipped_for_missing_school.append(
+                                {
+                                    "name": record_details.get("name", user_id),
+                                    "phone": record_details.get("phone", ""),
+                                    "email": record.get("email", ""),
+                                    "source_name": library["source_name"],
+                                    "context": "bulk_saved_certificate",
+                                }
+                            )
                             failed_count += 1
                             run_log.append(
                                 f"Skipped: {user_id} (school not found, logged: {log_path})"
@@ -2234,6 +2255,20 @@ def render_saved_library_bulk_certificate_panel(report_type, key_prefix):
                     st.success(f"Sent {sent_count} certificate email(s) from {library['source_name']}.")
                 if failed_count:
                     st.error(f"{failed_count} certificate email(s) failed for {library['source_name']}.")
+                if skipped_for_missing_school:
+                    response = send_missing_school_log_to_ops(
+                        skipped_for_missing_school,
+                        source_name=library["source_name"],
+                        context="bulk_saved_certificate",
+                    )
+                    if response and response.status_code in (200, 201):
+                        st.info(
+                            f"Missing-school log emailed to {MISSING_SCHOOL_LOG_RECIPIENT} ({len(skipped_for_missing_school)} rows)."
+                        )
+                    else:
+                        st.warning(
+                            f"Could not email missing-school log to {MISSING_SCHOOL_LOG_RECIPIENT}; local log is saved at {MISSING_SCHOOL_LOG_PATH}."
+                        )
                 status_panel.success(
                     f"Completed certificate run for {library['source_name']}: {sent_count} sent, {failed_count} failed."
                 )
@@ -2494,6 +2529,45 @@ def log_missing_school_teacher(name="", phone="", email="", source_name="", cont
             ]
         )
     return str(MISSING_SCHOOL_LOG_PATH)
+
+
+def send_missing_school_log_to_ops(entries, source_name="", context="bulk_certificate"):
+    if not entries:
+        return None
+    try:
+        from send_pending_reports import send_email_with_attachment
+
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["name", "phone", "email", "source_name", "context"])
+        for entry in entries:
+            writer.writerow(
+                [
+                    entry.get("name", ""),
+                    entry.get("phone", ""),
+                    entry.get("email", ""),
+                    entry.get("source_name", source_name),
+                    entry.get("context", context),
+                ]
+            )
+
+        payload = csv_buffer.getvalue().encode("utf-8")
+        file_name = f"missing_school_teachers_{slugify_filename_part(source_name or 'survey')}.csv"
+        return send_email_with_attachment(
+            email=MISSING_SCHOOL_LOG_RECIPIENT,
+            name="Shrey",
+            file_name=file_name,
+            file_bytes=payload,
+            subject=f"Missing School Log - {source_name or 'Survey'}",
+            html_body=(
+                "<p>Hi Shrey,</p>"
+                "<p>Attached is the missing-school teacher list from the latest certificate send run.</p>"
+                "<p>Regards,<br/>R-Cube Survey Analyser</p>"
+            ),
+            attachment_mime_type="text/csv",
+        )
+    except Exception:
+        return None
 
 
 def find_phone_column(df):
@@ -4870,6 +4944,7 @@ def render_certificate_only_report(raw, uploaded_file, current_library_key):
 
                 sent_count = 0
                 failed_count = 0
+                skipped_for_missing_school = []
                 for index, (_, report_row) in enumerate(results.iterrows(), start=1):
                     row_details = enrich_certificate_details(
                         {
@@ -4896,6 +4971,15 @@ def render_certificate_only_report(raw, uploaded_file, current_library_key):
                             email=recipient_email,
                             source_name=uploaded_file.name,
                             context="bulk_certificate_only_send",
+                        )
+                        skipped_for_missing_school.append(
+                            {
+                                "name": row_details.get("name", ""),
+                                "phone": row_details.get("phone", ""),
+                                "email": recipient_email,
+                                "source_name": uploaded_file.name,
+                                "context": "bulk_certificate_only_send",
+                            }
                         )
                         failed_count += 1
                         run_log.append(
@@ -4935,6 +5019,20 @@ def render_certificate_only_report(raw, uploaded_file, current_library_key):
                     st.success(f"Sent {sent_count} certificate email(s).")
                 if failed_count:
                     st.error(f"{failed_count} certificate email(s) failed.")
+                if skipped_for_missing_school:
+                    response = send_missing_school_log_to_ops(
+                        skipped_for_missing_school,
+                        source_name=uploaded_file.name,
+                        context="bulk_certificate_only_send",
+                    )
+                    if response and response.status_code in (200, 201):
+                        st.info(
+                            f"Missing-school log emailed to {MISSING_SCHOOL_LOG_RECIPIENT} ({len(skipped_for_missing_school)} rows)."
+                        )
+                    else:
+                        st.warning(
+                            f"Could not email missing-school log to {MISSING_SCHOOL_LOG_RECIPIENT}; local log is saved at {MISSING_SCHOOL_LOG_PATH}."
+                        )
             except Exception as e:
                 st.error(f"Certificate sending failed: {e}")
         if st.session_state.email_batch_log:
@@ -5042,6 +5140,7 @@ def run_app():
         render_certificate_only_report(raw, uploaded_file, current_library_key)
         st.markdown("""<div style='margin-top: 1rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-family: DM Mono, monospace; font-size: 0.6rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; text-align: center;'>R-Cube Screening Metric · EDXSO Strategic Intelligence · Certificate Tool</div>""", unsafe_allow_html=True)
         return
+    certificate_overrides = {}
     survey_kind = infer_single_survey_kind(raw)
     if survey_kind in {"pre_assessment", "post_assessment"}:
         date_col = find_date_column(raw)
@@ -5073,15 +5172,16 @@ def run_app():
             )
         st.session_state[event_name_state_key] = certificate_event_name
         st.session_state[event_date_state_key] = certificate_event_date
+        certificate_overrides = {
+            "event_name": certificate_event_name,
+            "event_date": certificate_event_date,
+        }
         render_assessment_single_report(
             raw,
             uploaded_file,
             current_library_key,
             survey_kind,
-            certificate_overrides={
-                "event_name": certificate_event_name,
-                "event_date": certificate_event_date,
-            },
+            certificate_overrides=certificate_overrides,
         )
         st.markdown("""<div style='margin-top: 1rem; padding-top: 1.5rem; border-top: 1px solid #e2e8f0; font-family: DM Mono, monospace; font-size: 0.6rem; color: #94a3b8; letter-spacing: 0.15em; text-transform: uppercase; text-align: center;'>R-Cube Screening Metric · EDXSO Strategic Intelligence · Screening Tool</div>""", unsafe_allow_html=True)
         return

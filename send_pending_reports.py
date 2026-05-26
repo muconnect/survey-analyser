@@ -204,7 +204,15 @@ def smtp_is_configured() -> bool:
     )
 
 
-def send_email_with_smtp(email: str, name: str, file_name: str, file_bytes: bytes, subject: str, html_body: str):
+def send_email_with_smtp(
+    email: str,
+    name: str,
+    file_name: str,
+    file_bytes: bytes,
+    subject: str,
+    html_body: str,
+    attachment_mime_type: str = "application/pdf",
+):
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{CONFIG['from_name']} <{CONFIG['from_email']}>"
@@ -213,7 +221,12 @@ def send_email_with_smtp(email: str, name: str, file_name: str, file_bytes: byte
         "Please view this email in HTML format to read the full message and access the attached report."
     )
     msg.add_alternative(html_body, subtype="html")
-    msg.add_attachment(file_bytes, maintype="application", subtype="pdf", filename=file_name)
+    mime_type = (attachment_mime_type or "application/pdf").strip().lower()
+    if "/" in mime_type:
+        maintype, subtype = mime_type.split("/", 1)
+    else:
+        maintype, subtype = "application", "octet-stream"
+    msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=file_name)
 
     smtp_port = int(str(CONFIG["smtp_port"]).strip())
     with smtplib.SMTP(CONFIG["smtp_host"], smtp_port, timeout=60) as server:
@@ -227,11 +240,27 @@ def send_email_with_smtp(email: str, name: str, file_name: str, file_bytes: byte
     return SimpleSendResponse(200, "Sent via SMTP")
 
 
-def send_email_with_attachment(email: str, name: str, file_name: str, file_bytes: bytes, subject: str | None = None, html_body: str | None = None):
+def send_email_with_attachment(
+    email: str,
+    name: str,
+    file_name: str,
+    file_bytes: bytes,
+    subject: str | None = None,
+    html_body: str | None = None,
+    attachment_mime_type: str = "application/pdf",
+):
     subject = subject or CONFIG["subject"]
     html_body = html_body or render_email_html(name)
     if smtp_is_configured():
-        return send_email_with_smtp(email, name, file_name, file_bytes, subject, html_body)
+        return send_email_with_smtp(
+            email,
+            name,
+            file_name,
+            file_bytes,
+            subject,
+            html_body,
+            attachment_mime_type=attachment_mime_type,
+        )
 
     payload = {
         "from": {"address": CONFIG["from_email"], "name": CONFIG["from_name"]},
@@ -241,7 +270,7 @@ def send_email_with_attachment(email: str, name: str, file_name: str, file_bytes
         "attachments": [
             {
                 "name": file_name,
-                "mime_type": "application/pdf",
+                "mime_type": attachment_mime_type or "application/octet-stream",
                 "content": base64.b64encode(file_bytes).decode("utf-8"),
             }
         ],
