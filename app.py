@@ -619,8 +619,18 @@ def find_date_column(df):
     return find_column_name(
         df,
         [
+            "event date",
+            "event_date",
+            "eventdate",
+            "session date",
+            "session_date",
+            "workshop date",
+            "workshop_date",
             "start date",
+            "start_date",
+            "startdate",
             "survey date",
+            "survey_date",
             "date",
             "submission date",
             "submitted at",
@@ -1401,20 +1411,18 @@ def generate_certificate_pdf_playwright(
     template_path = certificate_dir / "template.html"
     if template_path.exists():
         html_doc = template_path.read_text()
-        html_doc = html_doc.replace("{{LOGO_URI}}", get_edxso_logo_data_uri())
-        html_doc = html_doc.replace(
-            "{{BACKGROUND_URI}}",
-            file_to_data_uri(certificate_dir / "background.png"),
-        )
-        html_doc = html_doc.replace(
-            "{{SIGNATURE_URI}}",
-            file_to_data_uri(certificate_dir / "signature.png"),
-        )
-        html_doc = html_doc.replace("{{NAME}}", participant_name)
-        html_doc = html_doc.replace("{{SCHOOL}}", school_name)
-        html_doc = html_doc.replace("{{DATE}}", event_date)
-        html_doc = html_doc.replace("{{EVENT_NAME}}", event_name)
-        html_doc = html_doc.replace("{{EVENT}}", event_name)
+        replacements = {
+            "LOGO_URI": get_edxso_logo_data_uri(),
+            "BACKGROUND_URI": file_to_data_uri(certificate_dir / "background.png"),
+            "SIGNATURE_URI": file_to_data_uri(certificate_dir / "signature.png"),
+            "NAME": participant_name,
+            "SCHOOL": school_name,
+            "DATE": event_date,
+            "EVENT_NAME": event_name,
+            "EVENT": event_name,
+        }
+        for key, value in replacements.items():
+            html_doc = re.sub(r"\{\{\s*" + re.escape(key) + r"\s*\}\}", str(value), html_doc)
     else:
         raise FileNotFoundError(f"Certificate template not found: {template_path}")
 
@@ -1983,6 +1991,16 @@ def render_generated_pdf_library(container, report_type="single", current_datase
                                             },
                                             source_name=survey_title,
                                         )
+                                        if is_current and current_dataset:
+                                            live_certificate_details = recover_contact_from_current_dataset(
+                                                current_dataset["raw"],
+                                                current_dataset["results"],
+                                                pdf_user,
+                                                pdf_info,
+                                                certificate_overrides=certificate_overrides,
+                                            )
+                                            if live_certificate_details.get("event_date"):
+                                                certificate_details["event_date"] = live_certificate_details["event_date"]
                                         override_event_name = str(certificate_overrides.get("event_name", "") or "").strip()
                                         override_event_date = str(certificate_overrides.get("event_date", "") or "").strip()
                                         if is_current and override_event_name:
