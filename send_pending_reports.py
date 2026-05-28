@@ -1,6 +1,7 @@
 import base64
 import os
 import re
+import socket
 from typing import List
 from pathlib import Path
 from typing import Callable
@@ -229,7 +230,21 @@ def send_email_with_smtp(
     msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=file_name)
 
     smtp_port = int(str(CONFIG["smtp_port"]).strip())
-    with smtplib.SMTP(CONFIG["smtp_host"], smtp_port, timeout=60) as server:
+    ipv4_candidates = [
+        item[4][0]
+        for item in socket.getaddrinfo(
+            CONFIG["smtp_host"],
+            smtp_port,
+            family=socket.AF_INET,
+            type=socket.SOCK_STREAM,
+        )
+    ]
+    smtp_connect_host = ipv4_candidates[0] if ipv4_candidates else CONFIG["smtp_host"]
+
+    with smtplib.SMTP(timeout=60) as server:
+        server.connect(smtp_connect_host, smtp_port)
+        # Keep TLS SNI/hostname aligned with the real mail host while using an IPv4 socket.
+        server._host = CONFIG["smtp_host"]
         server.ehlo()
         if smtp_port == 587:
             server.starttls()
