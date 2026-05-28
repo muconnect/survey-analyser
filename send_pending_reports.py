@@ -1,4 +1,4 @@
-import base64
+import logging
 import os
 import re
 import socket
@@ -9,7 +9,6 @@ import smtplib
 from email.message import EmailMessage
 
 import pandas as pd
-import requests
 
 
 def load_local_env(env_path: str = ".env") -> None:
@@ -31,6 +30,17 @@ def load_local_env(env_path: str = ".env") -> None:
 
 
 load_local_env()
+
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+EMAIL_LOG_PATH = LOG_DIR / "email_send.log"
+
+logger = logging.getLogger("survey_analyser.email")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    file_handler = logging.FileHandler(EMAIL_LOG_PATH)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(file_handler)
 
 
 CONFIG = {
@@ -241,24 +251,35 @@ def send_email_with_smtp(
     ]
     smtp_connect_host = ipv4_candidates[0] if ipv4_candidates else CONFIG["smtp_host"]
 
-    if smtp_port == 465:
-        with smtplib.SMTP_SSL(timeout=60) as server:
-            server.connect(smtp_connect_host, smtp_port)
-            server._host = CONFIG["smtp_host"]
-            server.ehlo()
-            server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(timeout=60) as server:
-            server.connect(smtp_connect_host, smtp_port)
-            # Keep TLS SNI/hostname aligned with the real mail host while using an IPv4 socket.
-            server._host = CONFIG["smtp_host"]
-            server.ehlo()
-            if smtp_port == 587:
-                server.starttls()
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(timeout=60) as server:
+                server.connect(smtp_connect_host, smtp_port)
+                server._host = CONFIG["smtp_host"]
                 server.ehlo()
-        server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
-        server.send_message(msg)
+                server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(timeout=60) as server:
+                server.connect(smtp_connect_host, smtp_port)
+                # Keep TLS SNI/hostname aligned with the real mail host while using an IPv4 socket.
+                server._host = CONFIG["smtp_host"]
+                server.ehlo()
+                if smtp_port == 587:
+                    server.starttls()
+                    server.ehlo()
+                server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
+                server.send_message(msg)
+    except Exception as exc:
+        logger.exception(
+            "SMTP send failed stage=connect/login/send host=%s port=%s to=%s name=%s file=%s",
+            CONFIG.get("smtp_host", ""),
+            smtp_port,
+            email,
+            name,
+            file_name,
+        )
+        raise exc
 
     return SimpleSendResponse(200, "Sent via SMTP")
 
@@ -274,57 +295,26 @@ def send_email_with_attachment(
 ):
     subject = subject or CONFIG["subject"]
     html_body = html_body or render_email_html(name)
-    smtp_error = None
-    if smtp_is_configured():
-        try:
-            return send_email_with_smtp(
-                email,
-                name,
-                file_name,
-                file_bytes,
-                subject,
-                html_body,
-                attachment_mime_type=attachment_mime_type,
-            )
-        except Exception as exc:
-            smtp_error = exc
+    if not smtp_is_configured():
+        logger.error(
+            "SMTP not configured to=%s name=%s file=%s host=%s port=%s",
+            email,
+            name,
+            file_name,
+            CONFIG.get("smtp_host", ""),
+            CONFIG.get("smtp_port", ""),
+        )
+        raise ValueError("SMTP is not fully configured. Set SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, and FROM_EMAIL in .env.")
 
-    if CONFIG.get("zepto_api_key"):
-        payload = {
-            "from": {"address": CONFIG["from_email"], "name": CONFIG["from_name"]},
-            "to": [{"email_address": {"address": email, "name": name or ""}}],
-            "subject": subject,
-            "htmlbody": html_body,
-            "attachments": [
-                {
-                    "name": file_name,
-                    "mime_type": attachment_mime_type or "application/octet-stream",
-                    "content": base64.b64encode(file_bytes).decode("utf-8"),
-                }
-            ],
-        }
-
-        try:
-            return requests.post(
-                "https://api.zeptomail.in/v1.1/email",
-                headers={
-                    "Authorization": require_config("zepto_api_key"),
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60,
-            )
-        except Exception as exc:
-            if smtp_error is not None:
-                raise RuntimeError(
-                    f"SMTP failed ({smtp_error}); ZeptoMail fallback failed ({exc})"
-                ) from exc
-            raise
-
-    if smtp_error is not None:
-        raise smtp_error
-
-    raise ValueError("No email transport configured. Set SMTP or ZEPTO_API_KEY in .env.")
+    return send_email_with_smtp(
+        email,
+        name,
+        file_name,
+        file_bytes,
+        subject,
+        html_body,
+        attachment_mime_type=attachment_mime_type,
+    )
 
 
 def send_certificate_email_with_attachment(
