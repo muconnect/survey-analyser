@@ -241,14 +241,22 @@ def send_email_with_smtp(
     ]
     smtp_connect_host = ipv4_candidates[0] if ipv4_candidates else CONFIG["smtp_host"]
 
-    with smtplib.SMTP(timeout=60) as server:
-        server.connect(smtp_connect_host, smtp_port)
-        # Keep TLS SNI/hostname aligned with the real mail host while using an IPv4 socket.
-        server._host = CONFIG["smtp_host"]
-        server.ehlo()
-        if smtp_port == 587:
-            server.starttls()
+    if smtp_port == 465:
+        with smtplib.SMTP_SSL(timeout=60) as server:
+            server.connect(smtp_connect_host, smtp_port)
+            server._host = CONFIG["smtp_host"]
             server.ehlo()
+            server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(timeout=60) as server:
+            server.connect(smtp_connect_host, smtp_port)
+            # Keep TLS SNI/hostname aligned with the real mail host while using an IPv4 socket.
+            server._host = CONFIG["smtp_host"]
+            server.ehlo()
+            if smtp_port == 587:
+                server.starttls()
+                server.ehlo()
         server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
         server.send_message(msg)
 
@@ -266,40 +274,57 @@ def send_email_with_attachment(
 ):
     subject = subject or CONFIG["subject"]
     html_body = html_body or render_email_html(name)
+    smtp_error = None
     if smtp_is_configured():
-        return send_email_with_smtp(
-            email,
-            name,
-            file_name,
-            file_bytes,
-            subject,
-            html_body,
-            attachment_mime_type=attachment_mime_type,
-        )
+        try:
+            return send_email_with_smtp(
+                email,
+                name,
+                file_name,
+                file_bytes,
+                subject,
+                html_body,
+                attachment_mime_type=attachment_mime_type,
+            )
+        except Exception as exc:
+            smtp_error = exc
 
-    payload = {
-        "from": {"address": CONFIG["from_email"], "name": CONFIG["from_name"]},
-        "to": [{"email_address": {"address": email, "name": name or ""}}],
-        "subject": subject,
-        "htmlbody": html_body,
-        "attachments": [
-            {
-                "name": file_name,
-                "mime_type": attachment_mime_type or "application/octet-stream",
-                "content": base64.b64encode(file_bytes).decode("utf-8"),
-            }
-        ],
-    }
+    if CONFIG.get("zepto_api_key"):
+        payload = {
+            "from": {"address": CONFIG["from_email"], "name": CONFIG["from_name"]},
+            "to": [{"email_address": {"address": email, "name": name or ""}}],
+            "subject": subject,
+            "htmlbody": html_body,
+            "attachments": [
+                {
+                    "name": file_name,
+                    "mime_type": attachment_mime_type or "application/octet-stream",
+                    "content": base64.b64encode(file_bytes).decode("utf-8"),
+                }
+            ],
+        }
 
-    return requests.post(
-        "https://api.zeptomail.in/v1.1/email",
-        headers={
-            "Authorization": require_config("zepto_api_key"),
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
-    )
+        try:
+            return requests.post(
+                "https://api.zeptomail.in/v1.1/email",
+                headers={
+                    "Authorization": require_config("zepto_api_key"),
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60,
+            )
+        except Exception as exc:
+            if smtp_error is not None:
+                raise RuntimeError(
+                    f"SMTP failed ({smtp_error}); ZeptoMail fallback failed ({exc})"
+                ) from exc
+            raise
+
+    if smtp_error is not None:
+        raise smtp_error
+
+    raise ValueError("No email transport configured. Set SMTP or ZEPTO_API_KEY in .env.")
 
 
 def send_certificate_email_with_attachment(
