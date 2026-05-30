@@ -1,14 +1,14 @@
+import base64
 import logging
 import os
 import re
-import socket
 from typing import List
 from pathlib import Path
 from typing import Callable
-import smtplib
 from email.message import EmailMessage
 
 import pandas as pd
+import requests
 
 
 def load_local_env(env_path: str = ".env") -> None:
@@ -45,10 +45,7 @@ if not logger.handlers:
 
 CONFIG = {
     "zepto_api_key": os.environ.get("ZEPTO_API_KEY", ""),
-    "smtp_host": os.environ.get("SMTP_HOST", ""),
-    "smtp_port": os.environ.get("SMTP_PORT", ""),
-    "smtp_username": os.environ.get("SMTP_USERNAME", ""),
-    "smtp_password": os.environ.get("SMTP_PASSWORD", ""),
+    "zepto_api_url": os.environ.get("ZEPTO_API_URL", "https://api.zeptomail.in/v1.1/email"),
     "from_email": os.environ.get("FROM_EMAIL", "events@edxso.com"),
     "from_name": os.environ.get("FROM_NAME", "Team EDXSO"),
     "subject": os.environ.get(
@@ -203,19 +200,16 @@ class SimpleSendResponse:
         self.text = text
 
 
-def smtp_is_configured() -> bool:
+def zepto_is_configured() -> bool:
     return all(
         [
-            CONFIG.get("smtp_host"),
-            CONFIG.get("smtp_port"),
-            CONFIG.get("smtp_username"),
-            CONFIG.get("smtp_password"),
+            CONFIG.get("zepto_api_key"),
             CONFIG.get("from_email"),
         ]
     )
 
 
-def send_email_with_smtp(
+def build_zeptomail_payload(
     email: str,
     name: str,
     file_name: str,
@@ -224,64 +218,88 @@ def send_email_with_smtp(
     html_body: str,
     attachment_mime_type: str = "application/pdf",
 ):
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = f"{CONFIG['from_name']} <{CONFIG['from_email']}>"
-    msg["To"] = f"{name} <{email}>" if name else email
-    msg.set_content(
-        "Please view this email in HTML format to read the full message and access the attached report."
-    )
-    msg.add_alternative(html_body, subtype="html")
     mime_type = (attachment_mime_type or "application/pdf").strip().lower()
     if "/" in mime_type:
         maintype, subtype = mime_type.split("/", 1)
     else:
         maintype, subtype = "application", "octet-stream"
-    msg.add_attachment(file_bytes, maintype=maintype, subtype=subtype, filename=file_name)
+    attachment_b64 = base64.b64encode(file_bytes).decode("ascii")
+    return {
+        "from": {
+            "address": CONFIG["from_email"],
+            "name": CONFIG["from_name"],
+        },
+        "to": [
+            {
+                "email_address": {
+                    "address": email,
+                    "name": name or email,
+                }
+            }
+        ],
+        "subject": subject,
+        "htmlbody": html_body,
+        "attachments": [
+            {
+                "name": file_name,
+                "content": attachment_b64,
+                "mime_type": f"{maintype}/{subtype}",
+            }
+        ],
+    }
 
-    smtp_port = int(str(CONFIG["smtp_port"]).strip())
-    ipv4_candidates = [
-        item[4][0]
-        for item in socket.getaddrinfo(
-            CONFIG["smtp_host"],
-            smtp_port,
-            family=socket.AF_INET,
-            type=socket.SOCK_STREAM,
-        )
-    ]
-    smtp_connect_host = ipv4_candidates[0] if ipv4_candidates else CONFIG["smtp_host"]
+
+def send_email_with_zeptomail(
+    email: str,
+    name: str,
+    file_name: str,
+    file_bytes: bytes,
+    subject: str,
+    html_body: str,
+    attachment_mime_type: str = "application/pdf",
+):
+    payload = build_zeptomail_payload(
+        email=email,
+        name=name,
+        file_name=file_name,
+        file_bytes=file_bytes,
+        subject=subject,
+        html_body=html_body,
+        attachment_mime_type=attachment_mime_type,
+    )
+
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Zoho-enczapikey {CONFIG['zepto_api_key']}",
+    }
 
     try:
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(timeout=60) as server:
-                server.connect(smtp_connect_host, smtp_port)
-                server._host = CONFIG["smtp_host"]
-                server.ehlo()
-                server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(timeout=60) as server:
-                server.connect(smtp_connect_host, smtp_port)
-                # Keep TLS SNI/hostname aligned with the real mail host while using an IPv4 socket.
-                server._host = CONFIG["smtp_host"]
-                server.ehlo()
-                if smtp_port == 587:
-                    server.starttls()
-                    server.ehlo()
-                server.login(CONFIG["smtp_username"], CONFIG["smtp_password"])
-                server.send_message(msg)
+        response = requests.post(
+            CONFIG["zepto_api_url"],
+            json=payload,
+            headers=headers,
+            timeout=60,
+        )
+        if response.status_code not in (200, 201):
+            logger.error(
+                "ZeptoMail send failed status=%s to=%s name=%s file=%s response=%s",
+                response.status_code,
+                email,
+                name,
+                file_name,
+                response.text[:1000],
+            )
+        return SimpleSendResponse(response.status_code, response.text)
     except Exception as exc:
         logger.exception(
-            "SMTP send failed stage=connect/login/send host=%s port=%s to=%s name=%s file=%s",
-            CONFIG.get("smtp_host", ""),
-            smtp_port,
+            "ZeptoMail send exception to=%s name=%s file=%s url=%s",
             email,
             name,
             file_name,
+            CONFIG.get("zepto_api_url", ""),
         )
         raise exc
-
-    return SimpleSendResponse(200, "Sent via SMTP")
 
 
 def send_email_with_attachment(
@@ -295,18 +313,17 @@ def send_email_with_attachment(
 ):
     subject = subject or CONFIG["subject"]
     html_body = html_body or render_email_html(name)
-    if not smtp_is_configured():
+    if not zepto_is_configured():
         logger.error(
-            "SMTP not configured to=%s name=%s file=%s host=%s port=%s",
+            "ZeptoMail not configured to=%s name=%s file=%s api_url=%s",
             email,
             name,
             file_name,
-            CONFIG.get("smtp_host", ""),
-            CONFIG.get("smtp_port", ""),
+            CONFIG.get("zepto_api_url", ""),
         )
-        raise ValueError("SMTP is not fully configured. Set SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, and FROM_EMAIL in .env.")
+        raise ValueError("ZeptoMail is not fully configured. Set ZEPTO_API_KEY and FROM_EMAIL in .env.")
 
-    return send_email_with_smtp(
+    return send_email_with_zeptomail(
         email,
         name,
         file_name,
